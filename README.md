@@ -1,12 +1,14 @@
-# 帕朵一号 / Novel Memory
+# 帕朵一号
 
-长篇小说知识库、对话、改写与阅读工具，包含 Windows 桌面端和 Android 端源码。
+## 当前功能
 
-- `desktop/`：Python 桌面端源码。运行 `python app.py` 可启动本地网页界面；`python desktop_launcher.py` 使用独立窗口（需安装 `pywebview` 与 Windows WebView2）。
-- `android/`：Android 原生外壳、WebView 页面与单元测试。使用 JDK 17、Android SDK 35、Gradle 8.11.1 构建。
+- Windows 桌面端与 Android 端运行；支持多个相互独立的小说知识库。
+- 导入 TXT、Markdown、EPUB 小说，按章节切分、编辑原文并生成章节记忆、关键词与特殊场景标签。
+- 基于知识库进行问答和角色扮演对话，管理角色卡与多个对话存档；可选开启联网搜索。
+- 按章节或关键词改写小说，使用统一提示词、章节提示词和可导入的改写模板。
+- 阅读原文与改写稿，支持上下滑动或左右翻页，以及字号、颜色、间距等排版设置。
 
-本仓库**不包含** API Key、个人提示词配置、知识库 SQLite、导入的小说、聊天记录、构建缓存或安装包。运行时会在本机创建数据目录。不要把本机的 `data/`、`provider_configs/` 或数据库文件提交到公开仓库。
+## 待实现功能
 
-桌面端基础功能主要使用 Python 标准库；独立窗口需 `pywebview`。测试：在 `desktop/` 中运行 `python -m unittest test_scene_workspace test_epub_import`。Android 测试与构建：在 `android/` 中运行 `gradle :app:testDebugUnitTest :app:assembleDebug`。
+- 暂无已确认的下一阶段功能，后续根据使用反馈确定。
 
-应用完全免费、非商业，仅供学习与交流。项目并非《崩坏3》官方产品；图像素材的使用及再分发注意事项见 `android/ASSET_NOTICE.md`。
