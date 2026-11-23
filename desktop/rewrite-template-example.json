@@ -1,0 +1,15 @@
+{
+  "format": "novel-memory-rewrite-template",
+  "version": 1,
+  "name": "通用章节改写",
+  "tags": [],
+  "filter": {
+    "mode": "all",
+    "tags": []
+  },
+  "rewrite": {
+    "global_prompt": "遵循原文的事件顺序、人物关系和世界设定，以自然流畅的语言改写。",
+    "chapter_prompt": "完整覆盖本章情节，保持人物行为动机一致。",
+    "rules": "只输出改写正文；不得遗漏重要情节；不得重复段落。"
+  }
+}
