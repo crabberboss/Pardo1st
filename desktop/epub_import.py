@@ -1,5 +1,6 @@
 """Extract reflowable EPUB spine text without executing book HTML."""
 import io
+import mimetypes
 import posixpath
 import zipfile
 import xml.etree.ElementTree as ET
@@ -63,3 +64,31 @@ def extract_epub(raw: bytes, max_chars: int = 30_000_000) -> str:
         return "\n\n".join(sections)
     except (zipfile.BadZipFile, KeyError, ET.ParseError, StopIteration) as exc:
         raise ValueError("EPUB 结构无效或缺少章节目录") from exc
+
+
+def extract_epub_images(raw: bytes) -> list[dict]:
+    """Return supported manifest images without evaluating book HTML."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as book:
+        container = ET.fromstring(book.read("META-INF/container.xml"))
+        rootfile = next(node.attrib["full-path"] for node in container.iter() if node.tag.endswith("rootfile"))
+        opf = ET.fromstring(book.read(rootfile))
+        base = posixpath.dirname(rootfile)
+        images = []
+        total = 0
+        for item in opf.iter():
+            if not item.tag.endswith("item"):
+                continue
+            href = item.attrib.get("href", "").split("#", 1)[0]
+            path = posixpath.normpath(posixpath.join(base, href))
+            mime = item.attrib.get("media-type") or mimetypes.guess_type(path)[0] or ""
+            if mime not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+                continue
+            if not href or path.startswith("../") or path not in book.namelist():
+                continue
+            info = book.getinfo(path)
+            if info.file_size > 12_000_000 or total + info.file_size > 80_000_000:
+                continue
+            content = book.read(path)
+            total += len(content)
+            images.append({"filename": posixpath.basename(path), "mime": mime, "content": content})
+        return images

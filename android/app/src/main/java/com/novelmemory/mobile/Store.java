@@ -1,6 +1,7 @@
 package com.novelmemory.mobile;
 
 import android.content.Context;
+import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
@@ -28,7 +29,7 @@ import java.util.regex.PatternSyntaxException;
 final class Store extends SQLiteOpenHelper {
     private static final Pattern HEADING = Pattern.compile("^(?:第\\s*[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟萬0-9０-９]+\\s*[章节卷回部集篇幕].{0,90}|[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟萬0-9０-９]{1,8}\\s*[章节卷回部集篇幕].{0,90}|卷\\s*[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟萬0-9０-９]+.{0,90}|[一二三四五六七八九十百零〇两壹贰叁肆伍陆柒捌玖拾佰]{1,6}|(?:chapter|chap\\.?)\\s*(?:\\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)(?:\\s*[:：.\\-—])?\\s*.{0,90}|(?:序章|序幕|楔子|引子|前言|尾声|后记|番外|终章|外传|插曲).{0,90}|\\d{1,5}\\s*[.、．:：\\-—]\\s*.{1,90})$", Pattern.CASE_INSENSITIVE);
 
-    Store(Context context) { super(context, "novel_memory_mobile.db", null, 4); }
+    Store(Context context) { super(context, "novel_memory_mobile.db", null, 8); }
 
     @Override public void onCreate(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE archives(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',overview TEXT DEFAULT '',tags_json TEXT DEFAULT '[]',hits_json TEXT DEFAULT '[]',edits_json TEXT DEFAULT '[]',rewrite_global_prompt TEXT,created_at INTEGER DEFAULT 0)");
@@ -36,8 +37,11 @@ final class Store extends SQLiteOpenHelper {
         db.execSQL("CREATE TABLE chapters(id INTEGER PRIMARY KEY AUTOINCREMENT,archive_id INTEGER NOT NULL,doc_id INTEGER NOT NULL,ord INTEGER NOT NULL,title TEXT NOT NULL,text TEXT NOT NULL,char_start INTEGER DEFAULT 0,char_end INTEGER DEFAULT 0,token_count INTEGER DEFAULT 0,summary TEXT DEFAULT '',tags TEXT DEFAULT '',error TEXT DEFAULT '',rewrite TEXT DEFAULT '',rewrite_partial TEXT DEFAULT '',chapter_prompt TEXT DEFAULT '',extra_instruction TEXT DEFAULT '',rewrite_status TEXT DEFAULT '未改写')");
         db.execSQL("CREATE INDEX chapter_order ON chapters(archive_id,doc_id,ord)");
         db.execSQL("CREATE TABLE summaries(id INTEGER PRIMARY KEY AUTOINCREMENT,archive_id INTEGER NOT NULL,scope TEXT NOT NULL,source_key TEXT NOT NULL,title TEXT,content TEXT,UNIQUE(archive_id,scope,source_key))");
+        createEpubImagesTable(db);
         db.execSQL("CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,archive_id INTEGER NOT NULL,session_id INTEGER NOT NULL DEFAULT 0,role TEXT NOT NULL,content TEXT NOT NULL,timeline_before INTEGER NOT NULL DEFAULT 0,timeline_after INTEGER NOT NULL DEFAULT 0)");
         createChatTables(db);
+        createVectorTables(db);
+        createSourceVectorTables(db);
     }
 
     private static void createChatTables(SQLiteDatabase db) {
@@ -48,8 +52,21 @@ final class Store extends SQLiteOpenHelper {
         db.execSQL("CREATE TABLE IF NOT EXISTS chat_presets(archive_id INTEGER PRIMARY KEY,config_json TEXT NOT NULL)");
     }
 
+    private static void createEpubImagesTable(SQLiteDatabase db){db.execSQL("CREATE TABLE IF NOT EXISTS epub_images(id INTEGER PRIMARY KEY AUTOINCREMENT,archive_id INTEGER NOT NULL,document_id INTEGER NOT NULL DEFAULT 0,image_ord INTEGER NOT NULL,filename TEXT NOT NULL,mime TEXT NOT NULL,content BLOB NOT NULL)");}
+
+    private static void createVectorTables(SQLiteDatabase db){
+        db.execSQL("CREATE TABLE IF NOT EXISTS vector_configs(archive_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,provider TEXT NOT NULL,model TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS summary_vectors(archive_id INTEGER NOT NULL,chapter_id INTEGER NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,summary_hash TEXT NOT NULL,dimensions INTEGER NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(archive_id,chapter_id))");
+        db.execSQL("CREATE INDEX IF NOT EXISTS summary_vectors_archive ON summary_vectors(archive_id)");
+    }
+    private static void createSourceVectorTables(SQLiteDatabase db){
+        db.execSQL("CREATE TABLE IF NOT EXISTS source_vector_configs(archive_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,provider TEXT NOT NULL,model TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS source_vectors(archive_id INTEGER NOT NULL,chapter_id INTEGER NOT NULL,part INTEGER NOT NULL,char_start INTEGER NOT NULL,char_end INTEGER NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,source_hash TEXT NOT NULL,dimensions INTEGER NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(archive_id,chapter_id,part,provider,model))");
+        db.execSQL("CREATE INDEX IF NOT EXISTS source_vectors_archive ON source_vectors(archive_id,provider,model)");
+    }
+
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if(oldVersion<1||newVersion!=4)throw new IllegalStateException("Unsupported database schema");
+        if(oldVersion<1||newVersion!=8)throw new IllegalStateException("Unsupported database schema");
         if(oldVersion<2){
             db.execSQL("ALTER TABLE messages ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0");
             db.execSQL("ALTER TABLE messages ADD COLUMN timeline_before INTEGER NOT NULL DEFAULT 0");
@@ -71,6 +88,10 @@ final class Store extends SQLiteOpenHelper {
         if(oldVersion<4)try(Cursor chapters=db.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='chapters'",null)){
             if(chapters.moveToFirst())db.execSQL("ALTER TABLE chapters ADD COLUMN rewrite_partial TEXT DEFAULT ''");
         }
+        if(oldVersion<5)createEpubImagesTable(db);
+        if(oldVersion<6&&oldVersion>=5)db.execSQL("ALTER TABLE epub_images ADD COLUMN document_id INTEGER NOT NULL DEFAULT 0");
+        if(oldVersion<7)createVectorTables(db);
+        if(oldVersion<8)createSourceVectorTables(db);
     }
 
     static String s(Cursor c, String key) { int i=c.getColumnIndexOrThrow(key); return c.isNull(i)?"":c.getString(i); }
@@ -112,6 +133,11 @@ final class Store extends SQLiteOpenHelper {
             db.delete("roleplay_profiles","archive_id=?",args);
             db.delete("chat_presets","archive_id=?",args);
             db.delete("summaries","archive_id=?",args);
+            db.delete("summary_vectors","archive_id=?",args);
+            db.delete("vector_configs","archive_id=?",args);
+            db.delete("source_vectors","archive_id=?",args);
+            db.delete("source_vector_configs","archive_id=?",args);
+            db.delete("epub_images","archive_id=?",args);
             db.delete("chapters","archive_id=?",args);
             db.delete("documents","archive_id=?",args);
             db.delete("archives","id=?",args);
@@ -359,6 +385,7 @@ final class Store extends SQLiteOpenHelper {
             String key="doc:"+chapter.getLong("doc_id")+":chapter:"+chapter.getString("title");
             db.delete("summaries","archive_id=? AND ((scope='chapter' AND source_key=?) OR (scope='chunk' AND source_key=?))",
                     new String[]{Long.toString(archiveId),key,"chunk:"+chapterId});
+            db.delete("source_vectors","archive_id=? AND chapter_id=?",new String[]{Long.toString(archiveId),Long.toString(chapterId)});
             updateSourceMetadata(db,archiveId,chapter.getLong("doc_id"),chapter.getString("title"),false);
             db.execSQL("UPDATE documents SET char_count=(SELECT COALESCE(SUM(LENGTH(text)),0) FROM chapters WHERE archive_id=? AND doc_id=?) WHERE archive_id=? AND source_id=?",
                     new Object[]{archiveId,chapter.getLong("doc_id"),archiveId,chapter.getLong("doc_id")});
@@ -373,6 +400,8 @@ final class Store extends SQLiteOpenHelper {
             if(chapter.getLong("archive_id")!=archiveId)throw new IllegalArgumentException("章节不属于当前知识库");
             long docId=chapter.getLong("doc_id");String title=chapter.getString("title");
             db.delete("chapters","id=? AND archive_id=?",new String[]{Long.toString(chapterId),Long.toString(archiveId)});
+            db.delete("summary_vectors","chapter_id=? AND archive_id=?",new String[]{Long.toString(chapterId),Long.toString(archiveId)});
+            db.delete("source_vectors","chapter_id=? AND archive_id=?",new String[]{Long.toString(chapterId),Long.toString(archiveId)});
             db.delete("summaries","archive_id=? AND ((scope='chapter' AND source_key=?) OR (scope='chunk' AND source_key=?))",
                     new String[]{Long.toString(archiveId),"doc:"+docId+":chapter:"+title,"chunk:"+chapterId});
             updateSourceMetadata(db,archiveId,docId,title,true);
@@ -482,10 +511,20 @@ final class Store extends SQLiteOpenHelper {
         return readColumn(chapterId,"text",length);
     }
 
+    synchronized String vectorSource(long chapterId) {
+        long length;
+        try(Cursor c=getReadableDatabase().rawQuery("SELECT LENGTH(text) FROM chapters WHERE id=?",new String[]{Long.toString(chapterId)})){
+            if(!c.moveToFirst())throw new IllegalArgumentException("章节不存在");length=c.getLong(0);
+        }
+        if(length>500000)throw new IllegalStateException("单章超过 50 万字，请先重新切分再建立原文索引");
+        return readColumn(chapterId,"text",length);
+    }
+
     synchronized void setSummary(long chapterId, String summary, String error) throws Exception {
         JSONObject ch=chapter(chapterId);
         SQLiteDatabase db=getWritableDatabase();
         android.content.ContentValues v=new android.content.ContentValues();v.put("summary",summary);v.put("error",error);db.update("chapters",v,"id=?",new String[]{Long.toString(chapterId)});
+        db.delete("summary_vectors","chapter_id=?",new String[]{Long.toString(chapterId)});
         if(!summary.isEmpty()) {
             String key="doc:"+ch.getLong("doc_id")+":chapter:"+ch.getString("title");
             upsertSummary(db,ch.getLong("archive_id"),"chapter",key,ch.getString("title"),summary);
@@ -588,8 +627,27 @@ final class Store extends SQLiteOpenHelper {
     }
 
     synchronized long importEpub(String filename,InputStream stream) throws Exception {
-        String text=EpubImport.extract(stream);
-        return importText(filename,new java.io.ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)));
+        java.io.ByteArrayOutputStream raw=new java.io.ByteArrayOutputStream();byte[] buffer=new byte[32768];int count;
+        while((count=stream.read(buffer))!=-1){if(raw.size()+count>100_000_000)throw new IllegalArgumentException("EPUB 文件超过 100 MB");raw.write(buffer,0,count);}
+        byte[] bytes=raw.toByteArray();String text=EpubImport.extract(new java.io.ByteArrayInputStream(bytes));
+        List<EpubImport.ImageAsset> images=EpubImport.extractImages(new java.io.ByteArrayInputStream(bytes));
+        long archiveId=importText(filename,new java.io.ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)));
+        SQLiteDatabase db=getWritableDatabase();db.beginTransaction();
+        try{int ord=0;for(EpubImport.ImageAsset image:images){android.content.ContentValues v=new android.content.ContentValues();v.put("archive_id",archiveId);v.put("image_ord",ord++);v.put("filename",image.name);v.put("mime",image.mime);v.put("content",image.content);db.insertOrThrow("epub_images",null,v);}db.setTransactionSuccessful();}
+        finally{db.endTransaction();}
+        return archiveId;
+    }
+
+    synchronized JSONArray epubImages(long archiveId) throws Exception {
+        JSONArray out=new JSONArray();try(Cursor c=getReadableDatabase().rawQuery("SELECT id,filename,mime FROM epub_images WHERE archive_id=? ORDER BY image_ord",new String[]{Long.toString(archiveId)})){
+            while(c.moveToNext())out.put(new JSONObject().put("id",c.getLong(0)).put("filename",c.getString(1)).put("mime",c.getString(2)));
+        }return out;
+    }
+    synchronized JSONObject epubImage(long imageId) throws Exception {
+        try(Cursor c=getReadableDatabase().rawQuery("SELECT mime,content FROM epub_images WHERE id=?",new String[]{Long.toString(imageId)})){
+            if(!c.moveToFirst())throw new IllegalArgumentException("图片不存在");
+            return new JSONObject().put("data_url","data:"+c.getString(0)+";base64,"+android.util.Base64.encodeToString(c.getBlob(1),android.util.Base64.NO_WRAP));
+        }
     }
 
     private static Pattern splitPattern(String expression) {
@@ -681,6 +739,8 @@ final class Store extends SQLiteOpenHelper {
                         while(parts.moveToNext())source.append(readColumn(n(parts,"id"),"text",n(parts,"chars")));
                     }
                     db.delete("chapters","archive_id=? AND doc_id=?",new String[]{Long.toString(archiveId),Long.toString(docId)});
+                    db.delete("summary_vectors","archive_id=?",new String[]{Long.toString(archiveId)});
+                    db.delete("source_vectors","archive_id=?",new String[]{Long.toString(archiveId)});
                     java.io.BufferedReader lines=new java.io.BufferedReader(new java.io.StringReader(source.toString()));
                     StringBuilder body=new StringBuilder();String title="正文开头",line;int ord=0;
                     while((line=lines.readLine())!=null){
@@ -720,6 +780,7 @@ final class Store extends SQLiteOpenHelper {
         long archiveId=0;SQLiteDatabase db=getWritableDatabase();
         String format="";int version=0;JSONArray pendingSummaries=new JSONArray();
         java.util.HashMap<String,Long> chapterIds=new java.util.HashMap<>();
+        java.util.HashMap<Long,String> importedSourceHashes=new java.util.HashMap<>();
         try(JsonReader reader=new JsonReader(new InputStreamReader(stream,StandardCharsets.UTF_8))) {
             db.beginTransaction();reader.beginObject();
             while(reader.hasNext()) {
@@ -756,10 +817,51 @@ final class Store extends SQLiteOpenHelper {
                 if("special_tags".equals(key)||"special_tag_hits".equals(key)||"chapter_source_edits".equals(key)){
                     JSONArray value=(JSONArray)readValue(reader);android.content.ContentValues v=new android.content.ContentValues();v.put("special_tags".equals(key)?"tags_json":"special_tag_hits".equals(key)?"hits_json":"edits_json",value.toString());db.update("archives",v,"id=?",new String[]{Long.toString(archiveId)});continue;
                 }
+                if("epub_images".equals(key)){
+                    reader.beginArray();while(reader.hasNext()){
+                        JSONObject image=(JSONObject)readValue(reader);
+                        byte[] content=android.util.Base64.decode(image.optString("content_base64",""),android.util.Base64.DEFAULT);
+                        if(content.length==0||content.length>15_000_000)throw new IOException("EPUB 插图为空或超过 15 MB");
+                        android.content.ContentValues v=new android.content.ContentValues();v.put("archive_id",archiveId);
+                        v.put("document_id",image.optLong("document_id",0));v.put("image_ord",image.optInt("image_ord",0));v.put("filename",image.optString("filename","image"));
+                        v.put("mime",image.optString("mime","image/jpeg"));v.put("content",content);
+                        db.insertOrThrow("epub_images",null,v);
+                    }reader.endArray();continue;
+                }
+                if("source_vector_index".equals(key)){
+                    String backend="",provider="",model="";int imported=0;
+                    reader.beginObject();while(reader.hasNext()){
+                        String field=reader.nextName();
+                        if("backend".equals(field)){backend=reader.nextString();continue;}
+                        if("provider".equals(field)){provider=reader.nextString();continue;}
+                        if("model".equals(field)){model=reader.nextString();continue;}
+                        if("records".equals(field)){
+                            reader.beginArray();while(reader.hasNext()){
+                                JSONObject row=(JSONObject)readValue(reader);
+                                String group=row.optLong("document_id",0)+"\u0000"+row.optString("chapter_title","");
+                                Long chapterId=chapterIds.get(group);if(chapterId==null)continue;
+                                String hash=importedSourceHashes.get(chapterId);
+                                if(hash==null){hash=sha256(vectorSource(chapterId));importedSourceHashes.put(chapterId,hash);}
+                                if(!hash.equals(row.optString("source_hash","")))continue;
+                                int dims=row.optInt("dimension",0),start=row.optInt("char_start",-1),end=row.optInt("char_end",-1);
+                                byte[] vector=android.util.Base64.decode(row.optString("vector_base64",""),android.util.Base64.DEFAULT);
+                                if(dims<1||dims>8192||vector.length!=dims*4||start<0||end<=start)continue;
+                                ContentValues v=new ContentValues();v.put("archive_id",archiveId);v.put("chapter_id",chapterId);v.put("part",row.optInt("part",0));v.put("char_start",start);v.put("char_end",end);v.put("provider",provider);v.put("model",model);v.put("source_hash",hash);v.put("dimensions",dims);v.put("vector",vector);
+                                db.insertWithOnConflict("source_vectors",null,v,SQLiteDatabase.CONFLICT_REPLACE);imported++;
+                            }reader.endArray();continue;
+                        }
+                        reader.skipValue();
+                    }reader.endObject();
+                    if(imported>0&&!model.isEmpty()){
+                        ContentValues v=new ContentValues();v.put("archive_id",archiveId);v.put("enabled","online".equals(backend)&&("siliconflow".equals(provider)||"openrouter".equals(provider))?1:0);v.put("provider",provider);v.put("model",model);
+                        db.insertWithOnConflict("source_vector_configs",null,v,SQLiteDatabase.CONFLICT_REPLACE);
+                    }
+                    continue;
+                }
                 reader.skipValue();
             }
             reader.endObject();
-            if(!"novel-memory-archive".equals(format)||version<2||version>4||archiveId==0)throw new IOException("仅支持桌面端 novel-memory-archive v2–v4 文件");
+            if(!"novel-memory-archive".equals(format)||version<2||version>5||archiveId==0)throw new IOException("仅支持 novel-memory-archive v2–v5 文件");
             for(int i=0;i<pendingSummaries.length();i++){
                 JSONObject sum=pendingSummaries.getJSONObject(i);String scope=sum.optString("scope","");String sourceKey=sum.optString("source_key","");String content=sum.optString("content","");
                 upsertSummary(db,archiveId,scope,sourceKey,sum.optString("title",""),content);
@@ -785,7 +887,7 @@ final class Store extends SQLiteOpenHelper {
     synchronized void exportKnowledgeBase(long archiveId,OutputStream stream) throws Exception {
         JSONObject archive=archive(archiveId);SQLiteDatabase db=getReadableDatabase();
         try(JsonWriter w=new JsonWriter(new BufferedWriter(new OutputStreamWriter(stream,StandardCharsets.UTF_8),65536))){
-            w.setIndent("  ");w.beginObject();w.name("format").value("novel-memory-archive");w.name("version").value(4);w.name("exported_at").value(System.currentTimeMillis()/1000);
+            w.setIndent("  ");w.beginObject();w.name("format").value("novel-memory-archive");w.name("version").value(5);w.name("exported_at").value(System.currentTimeMillis()/1000);
             w.name("archive").beginObject().name("name").value(archive.getString("name")).name("description").value(archive.getString("description")).endObject();
             w.name("documents").beginArray();
             try(Cursor c=db.rawQuery("SELECT source_id,filename,title,char_count FROM documents WHERE archive_id=? ORDER BY source_id",new String[]{Long.toString(archiveId)})){
@@ -803,6 +905,39 @@ final class Store extends SQLiteOpenHelper {
             w.name("special_tags");writeJsonArray(w,new JSONArray(archive.getString("tags_json")));
             w.name("special_tag_hits");writeJsonArray(w,new JSONArray(archive.getString("hits_json")));
             w.name("chapter_source_edits");writeJsonArray(w,new JSONArray(archive.getString("edits_json")));
+            w.name("epub_images").beginArray();
+            try(Cursor c=db.rawQuery("SELECT id,document_id,image_ord,filename,mime,LENGTH(content) bytes FROM epub_images WHERE archive_id=? ORDER BY image_ord",new String[]{Long.toString(archiveId)})){
+                while(c.moveToNext()){
+                    long imageId=n(c,"id"),size=n(c,"bytes");
+                    if(size<=0||size>15_000_000)throw new IOException("EPUB 插图为空或超过 15 MB");
+                    java.io.ByteArrayOutputStream image=new java.io.ByteArrayOutputStream((int)size);
+                    for(long offset=1;offset<=size;offset+=65536){
+                        try(Cursor part=db.rawQuery("SELECT substr(content,?,65536) FROM epub_images WHERE id=?",new String[]{Long.toString(offset),Long.toString(imageId)})){
+                            if(!part.moveToFirst())throw new IOException("EPUB 插图不存在");
+                            image.write(part.getBlob(0));
+                        }
+                    }
+                    w.beginObject().name("document_id").value(n(c,"document_id")).name("image_ord").value(n(c,"image_ord")).name("filename").value(s(c,"filename"))
+                        .name("mime").value(s(c,"mime")).name("content_base64")
+                        .value(android.util.Base64.encodeToString(image.toByteArray(),android.util.Base64.NO_WRAP)).endObject();
+                }
+            }w.endArray();
+            String sourceProvider="",sourceModel="";
+            try(Cursor cfg=db.rawQuery("SELECT provider,model FROM source_vector_configs WHERE archive_id=?",new String[]{Long.toString(archiveId)})){
+                if(cfg.moveToFirst()){sourceProvider=cfg.getString(0);sourceModel=cfg.getString(1);}
+            }
+            w.name("source_vector_index").beginObject().name("backend").value("siliconflow".equals(sourceProvider)||"openrouter".equals(sourceProvider)?"online":sourceProvider)
+                .name("provider").value(sourceProvider).name("model").value(sourceModel).name("records").beginArray();
+            try(Cursor vectors=db.rawQuery("SELECT v.chapter_id,c.doc_id,c.title,v.part,v.char_start,v.char_end,v.source_hash,v.dimensions,v.vector "
+                    +"FROM source_vectors v JOIN chapters c ON c.id=v.chapter_id WHERE v.archive_id=? AND v.provider=? AND v.model=? ORDER BY c.doc_id,c.ord,v.part",
+                    new String[]{Long.toString(archiveId),sourceProvider,sourceModel})){
+                while(vectors.moveToNext())w.beginObject().name("document_id").value(vectors.getLong(1))
+                    .name("chapter_title").value(vectors.getString(2)).name("part").value(vectors.getInt(3))
+                    .name("char_start").value(vectors.getInt(4)).name("char_end").value(vectors.getInt(5))
+                    .name("source_hash").value(vectors.getString(6)).name("dimension").value(vectors.getInt(7))
+                    .name("vector_base64").value(android.util.Base64.encodeToString(vectors.getBlob(8),android.util.Base64.NO_WRAP)).endObject();
+            }
+            w.endArray().endObject();
             w.endObject();
         }
     }

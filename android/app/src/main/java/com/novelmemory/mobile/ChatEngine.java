@@ -8,6 +8,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.net.HttpURLConnection;
@@ -18,15 +19,16 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 
 final class ChatEngine {
-    private final Store store;private final ChatData data;private final Api api;private final SharedPreferences prefs;
+    private final Store store;private final ChatData data;private final Api api;private final VectorMemory vectors;private final SharedPreferences prefs;
     private static final Pattern PROGRESS=Pattern.compile("<!--\\s*NM_PROGRESS\\s*:\\s*([0-3])\\s*-->");
-    ChatEngine(Context context,Store store,ChatData data,Api api){this.store=store;this.data=data;this.api=api;this.prefs=context.getSharedPreferences("chat_globals",Context.MODE_PRIVATE);}
+    ChatEngine(Context context,Store store,ChatData data,Api api){this.store=store;this.data=data;this.api=api;this.vectors=new VectorMemory(store,api);this.prefs=context.getSharedPreferences("chat_globals",Context.MODE_PRIVATE);}
 
     JSONObject globals() throws Exception {return new JSONObject().put("chat_prompt",prefs.getString("chat_prompt","以知识库与原文为准回答，不确定时明确说明。"))
             .put("roleplay_prompt",prefs.getString("roleplay_prompt","这是书中虚构世界的文学角色扮演。保持人物性格与场景连续，不复读、不跳出角色；遵守 API 服务商安全规则。"))
             .put("user_name",prefs.getString("user_name","用户"))
             .put("web_search_enabled",prefs.getBoolean("web_search_enabled",false))
             .put("web_search_has_key",!prefs.getString("brave_search_key","").isEmpty());}
+    String exportSearchKey(){return prefs.getString("brave_search_key","");}
     JSONObject saveGlobals(JSONObject values) throws Exception {SharedPreferences.Editor e=prefs.edit();for(String key:new String[]{"chat_prompt","roleplay_prompt","user_name"})if(values.has(key))e.putString(key,values.optString(key,""));if(values.has("web_search_enabled"))e.putBoolean("web_search_enabled",values.optBoolean("web_search_enabled",false));if(!values.optString("brave_search_key","").trim().isEmpty())e.putString("brave_search_key",values.optString("brave_search_key").trim());if(values.optBoolean("clear_search_key",false)){e.remove("brave_search_key");e.putBoolean("web_search_enabled",false);}e.apply();return globals();}
 
     private String webSearch(String query) throws Exception {
@@ -50,7 +52,7 @@ final class ChatEngine {
     }
 
     private static final class Memory {
-        long id;int position;String title,summary;double score;
+        long id;int position;String title,summary;double score;int sourceStart=-1,sourceEnd=-1;
         Memory(long id,int position,String title,String summary,double score){this.id=id;this.position=position;this.title=title;this.summary=summary;this.score=score;}
     }
     private static String clip(String value,int n){return value==null?"":value.length()>n?value.substring(0,n):value;}
@@ -70,9 +72,29 @@ final class ChatEngine {
             while(c.moveToNext()){
                 position++;if(cutoff>0&&position>cutoff)break;
                 String title=c.getString(1),summary=c.getString(2);double value=score(query,title+" "+summary);
-                if(value>0)best.add(new Memory(c.getLong(0),position,title,summary,value));
+                best.add(new Memory(c.getLong(0),position,title,summary,value));
             }
         }
+        Map<Long,Double> semantic=new java.util.HashMap<>();
+        try{semantic=vectors.search(archiveId,query,cutoff);}catch(Exception ignored){/* Network/index failure must not disable ordinary chapter retrieval. */}
+        Map<Long,VectorMemory.SourceHit> sourceHits=new java.util.HashMap<>();
+        try{sourceHits=vectors.searchSource(archiveId,query,cutoff);}catch(Exception ignored){/* Preserve keyword fallback. */}
+        if(semantic.isEmpty()&&sourceHits.isEmpty()){
+            best.removeIf(m->m.score<=0);best.sort(Comparator.comparingDouble((Memory m)->m.score).reversed());
+            return best.subList(0,Math.min(best.size(),topK));
+        }
+        List<Memory> lexical=new ArrayList<>(best);lexical.removeIf(m->m.score<=0);
+        lexical.sort(Comparator.comparingDouble((Memory m)->m.score).reversed());
+        Map<Long,Double> fused=new java.util.HashMap<>();
+        for(int i=0;i<lexical.size();i++)fused.put(lexical.get(i).id,1.0/(60+i));
+        List<Map.Entry<Long,Double>> ranked=new ArrayList<>(semantic.entrySet());
+        ranked.sort((a,b)->Double.compare(b.getValue(),a.getValue()));
+        for(int i=0;i<ranked.size();i++){Map.Entry<Long,Double> entry=ranked.get(i);fused.put(entry.getKey(),fused.getOrDefault(entry.getKey(),0.0)+1.0/(60+i));}
+        List<Map.Entry<Long,VectorMemory.SourceHit>> sourceRanked=new ArrayList<>(sourceHits.entrySet());
+        sourceRanked.sort((a,b)->Double.compare(b.getValue().score,a.getValue().score));
+        for(int i=0;i<sourceRanked.size();i++){Map.Entry<Long,VectorMemory.SourceHit> entry=sourceRanked.get(i);fused.put(entry.getKey(),fused.getOrDefault(entry.getKey(),0.0)+1.0/(60+i));}
+        best.removeIf(m->!fused.containsKey(m.id));
+        for(Memory memory:best){memory.score=fused.get(memory.id);VectorMemory.SourceHit hit=sourceHits.get(memory.id);if(hit!=null){memory.sourceStart=hit.start;memory.sourceEnd=hit.end;}}
         best.sort(Comparator.comparingDouble((Memory m)->m.score).reversed());
         return best.subList(0,Math.min(best.size(),topK));
     }
@@ -86,12 +108,18 @@ final class ChatEngine {
         StringBuilder out=new StringBuilder();
         for(Memory m:matches){out.append("\n[第 ").append(m.position).append(" 章：").append(m.title).append("]\n");
             if(summary)out.append(clip(m.summary,900)).append("\n");
-            if(source)out.append("原文片段：").append(clip(store.sourceSlice(m.id,0,1000).optString("text",""),1000)).append("\n");
+            if(source){int start=Math.max(0,m.sourceStart);out.append("原文片段：").append(clip(store.sourceSlice(m.id,start,1000).optString("text",""),1000)).append("\n");}
         }return out.toString();
     }
     private static String macros(String value,String character,String user){return value.replace("{{char}}",character).replace("{{user}}",user);}
 
     JSONObject respond(long archiveId,String mode,long profileId,long sessionId,String input,long assistantId) throws Exception {
+        return respond(archiveId,mode,profileId,sessionId,input,assistantId,"");
+    }
+
+    JSONObject respond(long archiveId,String mode,long profileId,long sessionId,String input,long assistantId,String imageUrl) throws Exception {
+        if(imageUrl==null)imageUrl="";
+        if(!imageUrl.isEmpty()&&assistantId>0)throw new IllegalArgumentException("重新生成历史回答时不能附带新图片，请新发一条消息");
         JSONObject session=data.ensureSession(archiveId,mode,profileId,sessionId);
         sessionId=session.getLong("id");boolean roleplay="roleplay".equals(session.getString("mode"));
         JSONObject priorUser=null,priorAnswer=null;
@@ -103,7 +131,6 @@ final class ChatEngine {
         int topK=Math.max(1,Math.min(12,roleplay?card.optInt("top_k",8):preset.optInt("top_k",5)));
         String query=roleplay?card.optString("character_name","")+" "+card.optString("scenario","")+" "+text:text;
         List<Memory> matches=retrieve(archiveId,query,cutoff,topK);
-        if(matches.isEmpty()&&!roleplay)matches=retrieve(archiveId,text,0,Math.min(topK,3));
         String context=memoryContext(archiveId,matches,roleplay||preset.optBoolean("use_chapter_summary",true),preset.optBoolean("use_source_text",true));
         String archiveOverview=preset.optBoolean("use_archive_summary",true)&&!roleplay&&cutoff==0?clip(store.archive(archiveId).optString("overview",""),1800):"";
         String system,userPrompt,plot="";int plotStep=0;
@@ -144,7 +171,10 @@ final class ChatEngine {
             recent.add(0,new JSONObject().put("role",item.getString("role")).put("content",content));historyBudget-=content.length();
         }
         for(JSONObject item:recent)messages.put(item);
-        messages.put(new JSONObject().put("role","user").put("content",clip(userPrompt,6500)));
+        Object userContent=imageUrl.isEmpty()?clip(userPrompt,6500):new JSONArray()
+            .put(new JSONObject().put("type","text").put("text",clip(userPrompt,6500)))
+            .put(new JSONObject().put("type","image_url").put("image_url",new JSONObject().put("url",imageUrl)));
+        messages.put(new JSONObject().put("role","user").put("content",userContent));
         int maxTokens=Math.max(256,Math.min(8192,preset.optInt("max_tokens",1800)));
         String answer=api.chat(messages,maxTokens,120,roleplay?Math.max(0.65,preset.optDouble("temperature",0.7)):preset.optDouble("temperature",0.6));
         if(roleplay){

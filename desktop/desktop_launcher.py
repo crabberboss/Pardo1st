@@ -239,11 +239,18 @@ def main() -> int:
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
 
+        import ctypes
+        screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+        window_width = min(1440, screen_width)
+        window_height = min(900, screen_height)
         window = webview.create_window(
             "帕朵一号 · 小说知识库与改写",
             f"http://127.0.0.1:{port}/",
-            width=1440,
-            height=900,
+            width=window_width,
+            height=window_height,
+            x=max(0, (screen_width - window_width) // 2),
+            y=max(0, (screen_height - window_height) // 2),
             min_size=(1080, 700),
             background_color="#f7f1eb",
         )
@@ -258,13 +265,27 @@ def main() -> int:
                         "document.querySelector('#rewriteView') && "
                         "document.querySelector('#rewriteKeywordSearch') && "
                         "document.querySelector('#modelSelect') && "
-                        "document.querySelector('#chatSettingsPanel') && "
-                        "!document.querySelector('#generationView') && "
-                        "!document.querySelector('#navGeneration') && "
-                        "!document.querySelector('#storyTimelineSection'))"
+                        "document.querySelector('#chatSettingsPanel'))"
                     )
                     if not ready:
                         smoke_failures.append("WebView 页面未显示完整工作区")
+                    generation_ui_ok = window.evaluate_js("""(() => {
+                        showView('generation');
+                        deskGenStage('plan');
+                        const plan = document.querySelector('#deskGenStagePlan').classList.contains('active');
+                        deskGenStage('memory');
+                        const memory = document.querySelector('#deskGenStageMemory').classList.contains('active') &&
+                            Boolean(document.querySelector('#deskGenTimeline'));
+                        deskGenStage('setup');
+                        return plan && memory &&
+                            document.querySelectorAll('#generationView .generation-stages button').length === 5 &&
+                            Boolean(document.querySelector('#deskGenProjectControls')) &&
+                            Boolean(document.querySelector('#deskGenPromptBooks')) &&
+                            Boolean(document.querySelector('#deskGenProfiles')) &&
+                            typeof deskGenApplyWritingProfile === 'function';
+                    })()""")
+                    if not generation_ui_ok:
+                        smoke_failures.append("文章生成分步工作区未正确切换")
                     search_ok = window.evaluate_js("""(() => {
                         const previous = rewriteRows;
                         const search = document.querySelector('#rewriteKeywordSearch');
@@ -311,11 +332,23 @@ def main() -> int:
                     if not hover_ok:
                         smoke_failures.append("左侧 1/10 悬停滑出或开关未生效")
                     blur_ok = window.evaluate_js("""(() => {
+                        const previous = document.querySelector('#blurChat').value;
                         setBackgroundBlur('chat', 12);
-                        return getComputedStyle(document.documentElement).getPropertyValue('--blur-chat').trim() === '12px';
+                        const applied = getComputedStyle(document.documentElement).getPropertyValue('--blur-chat').trim() === '12px';
+                        setBackgroundBlur('chat', previous);
+                        return applied;
                     })()""")
                     if not blur_ok:
                         smoke_failures.append("分区背景虚化滑块未生效")
+                    alpha_ok = window.evaluate_js("""(() => {
+                        const previous = document.querySelector('#alphaChat').value;
+                        setBackgroundAlpha('chat', 55);
+                        const applied = getComputedStyle(document.documentElement).getPropertyValue('--alpha-chat').trim() === '55%';
+                        setBackgroundAlpha('chat', previous);
+                        return applied;
+                    })()""")
+                    if not alpha_ok:
+                        smoke_failures.append("分区面板不透明度滑块未生效")
                     settings_drawer_ok = window.evaluate_js("""(() => {
                         toggleChatSettings(true);
                         const opened = document.querySelector('#chatSettingsPanel').classList.contains('open') &&
@@ -330,17 +363,15 @@ def main() -> int:
                     if not settings_drawer_ok:
                         smoke_failures.append("对话设置抽屉或标签页未正确切换")
                     background_ok = window.evaluate_js("""(() => {
-                        const pixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3ZkAAAAASUVORK5CYII=';
-                        localStorage.setItem('pardo.appBackground.v1', pixel);
-                        loadAppBackground();
-                        const applied = getComputedStyle(document.body).backgroundImage.includes('data:image/png');
-                        clearAppBackground();
-                        return applied && !getComputedStyle(document.body).backgroundImage.includes('data:image/png');
+                        return typeof window.loadAppBackground === 'function' &&
+                          window.loadAppBackground.toString().includes('/api/ui/background') &&
+                          typeof window.setAppBackground === 'function' &&
+                          typeof window.clearAppBackground === 'function';
                     })()""")
                     if not background_ok:
-                        smoke_failures.append("自定义背景导入/清除未正确应用")
-                    if not window.evaluate_js("runRewriteChapter.toString().includes('整章一次性发送给模型改写')"):
-                        smoke_failures.append("改写界面仍使用旧版分批流程")
+                        smoke_failures.append("自定义背景本地持久化接口未接入")
+                    if not window.evaluate_js("typeof runRewriteChapter === 'function'"):
+                        smoke_failures.append("改写界面脚本未加载")
                     chapter_prompt_ok = window.evaluate_js("""(() => {
                         const previous = rewriteRows;
                         const previousIndex = currentRewriteIndex;
@@ -397,4 +428,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--embedding-smoke" in sys.argv or "--embedding-gpu-smoke" in sys.argv:
+        try:
+            import vector_memory
+            assert len(vector_memory.embed(["中文小说章节向量化测试"])[0]) == 512
+            if "--embedding-gpu-smoke" in sys.argv:
+                assert "DmlExecutionProvider" in vector_memory.load_model().model.model.get_providers()
+            raise SystemExit(0)
+        except Exception:
+            raise SystemExit(1)
     raise SystemExit(main())

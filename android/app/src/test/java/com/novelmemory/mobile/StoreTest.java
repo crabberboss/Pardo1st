@@ -77,11 +77,39 @@ public class StoreTest {
         ByteArrayOutputStream file=new ByteArrayOutputStream();store.exportKnowledgeBase(first,file);
         JSONObject packageJson=new JSONObject(file.toString("UTF-8"));
         assertEquals("novel-memory-archive",packageJson.getString("format"));
-        assertEquals(4,packageJson.getInt("version"));
+        assertEquals(5,packageJson.getInt("version"));
         assertEquals(2,packageJson.getJSONArray("chunks").length());
         long second=store.importKnowledgeBase(new ByteArrayInputStream(file.toByteArray()));
         assertEquals(2,store.chapters(second,0,40,"").length());
         assertTrue(store.chapters(second,0,40,"").getJSONObject(0).getString("summary").contains("密室"));
+        store.close();
+    }
+
+    @Test public void epubImagesAndDocumentAssociationSurviveKnowledgeBaseRoundTrip() throws Exception {
+        Store store=freshStore();
+        long archive=store.importText("插图.txt",new ByteArrayInputStream("第一章 图示\n内容。".getBytes(StandardCharsets.UTF_8)));
+        android.content.ContentValues image=new android.content.ContentValues();image.put("archive_id",archive);
+        image.put("document_id",1);image.put("image_ord",0);image.put("filename","figure.png");
+        image.put("mime","image/png");image.put("content",new byte[]{1,2,3,4,5});
+        store.getWritableDatabase().insertOrThrow("epub_images",null,image);
+        ByteArrayOutputStream output=new ByteArrayOutputStream();store.exportKnowledgeBase(archive,output);
+        JSONObject exported=new JSONObject(output.toString("UTF-8"));
+        assertEquals(1,exported.getJSONArray("epub_images").length());
+        assertEquals(1,exported.getJSONArray("epub_images").getJSONObject(0).getInt("document_id"));
+        long imported=store.importKnowledgeBase(new ByteArrayInputStream(output.toByteArray()));
+        JSONArray images=store.epubImages(imported);assertEquals(1,images.length());
+        assertEquals("figure.png",images.getJSONObject(0).getString("filename"));
+        assertTrue(store.epubImage(images.getJSONObject(0).getLong("id")).getString("data_url").endsWith("AQIDBAU="));
+        store.close();
+    }
+
+    @Test public void chatPresetIsScopedToOneArchive() throws Exception {
+        Store store=freshStore();ChatData chat=new ChatData(store);
+        long first=store.createArchive("甲"),second=store.createArchive("乙");
+        JSONObject saved=chat.savePreset(first,new JSONObject().put("system_prompt","只给甲使用"));
+        assertEquals("只给甲使用",saved.getString("system_prompt"));
+        assertEquals("只给甲使用",chat.preset(first).getString("system_prompt"));
+        assertNotEquals("只给甲使用",chat.preset(second).getString("system_prompt"));
         store.close();
     }
 

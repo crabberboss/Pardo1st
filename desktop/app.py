@@ -17,6 +17,11 @@ import uuid
 import webbrowser
 import zlib
 import epub_import
+import vector_memory
+import generation_desktop_ui
+import generation_revision
+import writing_prompt_profiles
+import transfer_desktop_ui
 import rewrite_storyline as storyline
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -26,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 APP_NAME = "Novel Memory"
-APP_VERSION = "2.9.17"
+APP_VERSION = "2.9.25"
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 180
@@ -222,6 +227,36 @@ def init_db() -> None:
                 PRIMARY KEY (archive_id, chunk_id, term)
             );
 
+            CREATE TABLE IF NOT EXISTS summary_vectors (
+                archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                source_key TEXT NOT NULL,
+                part INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                summary_hash TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (archive_id, chunk_id, part, model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_summary_vectors_archive_model
+                ON summary_vectors(archive_id, model);
+
+            CREATE TABLE IF NOT EXISTS source_vectors (
+                archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                chapter_title TEXT NOT NULL,
+                part INTEGER NOT NULL,
+                char_start INTEGER NOT NULL,
+                char_end INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (archive_id, document_id, chapter_title, part, model)
+            );
+            CREATE INDEX IF NOT EXISTS idx_source_vectors_archive_model
+                ON source_vectors(archive_id, model);
+
             CREATE INDEX IF NOT EXISTS idx_chunks_archive ON chunks(archive_id);
             CREATE INDEX IF NOT EXISTS idx_terms_lookup ON term_index(archive_id, term);
 
@@ -237,6 +272,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS epub_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                image_ord INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                content BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS provider_configs (
@@ -1064,6 +1109,19 @@ def archive_detail(archive_id: int) -> Dict:
             "documents": [dict(row) for row in docs],
             "messages": [dict(row) for row in reversed(messages)],
             "summaries": [dict(row) for row in summaries],
+            "vector": {
+                "enabled": get_archive_setting(conn, archive_id, "vector_enabled", "0") == "1",
+                "source_enabled": get_archive_setting(conn, archive_id, "source_vector_enabled", "0") == "1",
+                "backend": get_archive_setting(conn, archive_id, "vector_backend", "builtin"),
+                "model": get_archive_setting(conn, archive_id, "vector_model", ""),
+                "base_url": get_archive_setting(conn, archive_id, "vector_base_url", vector_memory.DEFAULT_SERVICE_URL),
+                "online_source": get_archive_setting(conn, archive_id, "vector_online_source", "custom"),
+                "online_has_key": bool(get_setting(conn, "vector_online_api_key")),
+                "count": conn.execute("SELECT COUNT(DISTINCT chunk_id) AS n FROM summary_vectors WHERE archive_id=? AND model=?",
+                                      (archive_id, get_archive_setting(conn, archive_id, "vector_index_key"))).fetchone()["n"],
+                "source_count": conn.execute("SELECT COUNT(*) AS n FROM source_vectors WHERE archive_id=? AND model=?",
+                                      (archive_id, get_archive_setting(conn, archive_id, "source_vector_index_key"))).fetchone()["n"],
+            },
             "job": latest_job_for_archive(archive_id),
         }
 
@@ -1073,7 +1131,7 @@ def delete_archive(archive_id: int) -> None:
         conn.execute("DELETE FROM archives WHERE id=?", (archive_id,))
 
 
-def search_chunks(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1) -> List[Dict]:
+def search_chunks_keyword(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1) -> List[Dict]:
     q_terms = Counter(tokenize(query))
     if not q_terms:
         return []
@@ -1188,6 +1246,154 @@ def search_chunks(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1
         if not results:
             return like_fallback()
         return results
+
+
+def search_chunks(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1) -> List[Dict]:
+    """Fuse lexical, structured-memory and original-text retrieval."""
+    lexical = search_chunks_keyword(archive_id, query, top_k, max_ord)
+    sources = [lexical]
+    for search in (search_summary_vectors, search_source_vectors):
+        try:
+            matches = search(archive_id, query, top_k, max_ord)
+            if matches:
+                sources.append(matches)
+        except Exception:
+            # An unavailable embedding service never disables ordinary chat.
+            continue
+    ranked = {}
+    for results in sources:
+        for rank, item in enumerate(results):
+            chunk_id = int(item["id"])
+            if chunk_id not in ranked:
+                ranked[chunk_id] = {"item": item, "score": 0.0}
+            elif item.get("source_vector") and not ranked[chunk_id]["item"].get("source_vector"):
+                ranked[chunk_id]["item"] = item
+            ranked[chunk_id]["score"] += 1.0 / (60 + rank + 1)
+    return [entry["item"] for entry in sorted(ranked.values(), key=lambda entry: entry["score"], reverse=True)[:top_k]]
+
+
+def search_source_vectors(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1) -> List[Dict]:
+    with connect_db() as conn:
+        if get_archive_setting(conn, archive_id, "source_vector_enabled", "0") != "1":
+            return []
+        backend = get_archive_setting(conn, archive_id, "source_vector_backend", "builtin")
+        model = get_archive_setting(conn, archive_id, "source_vector_model", "")
+        base_url = get_archive_setting(conn, archive_id, "source_vector_base_url", vector_memory.DEFAULT_SERVICE_URL)
+        online_source = get_archive_setting(conn, archive_id, "source_vector_online_source", "custom")
+        base_url, api_key = resolve_vector_credentials(conn, backend, online_source, base_url)
+        key = get_archive_setting(conn, archive_id, "source_vector_index_key", "")
+        if not key:
+            return []
+        rows = conn.execute(
+            "SELECT document_id,chapter_title,part,char_start,char_end,source_hash,dimension,vector "
+            "FROM source_vectors WHERE archive_id=? AND model=?", (archive_id, key)
+        ).fetchall()
+        if not rows:
+            return []
+    query_vector = vector_memory.embed_with(backend, [query[:600]], model, base_url, api_key)[0]
+    with connect_db() as conn:
+        chapter_cache = {}
+        winners = []
+        for row in rows:
+            chapter_key = (row["document_id"], row["chapter_title"])
+            if chapter_key not in chapter_cache:
+                first = conn.execute(
+                    "SELECT id,ord FROM chunks WHERE archive_id=? AND document_id=? AND title=? ORDER BY ord LIMIT 1",
+                    (archive_id, *chapter_key),
+                ).fetchone()
+                if not first or (max_ord >= 0 and first["ord"] > max_ord):
+                    chapter_cache[chapter_key] = None
+                else:
+                    text = get_chapter_source_text(conn, archive_id, *chapter_key)
+                    chapter_cache[chapter_key] = (first["id"], first["ord"], text, vector_memory.digest(text))
+            chapter = chapter_cache[chapter_key]
+            if not chapter or chapter[3] != row["source_hash"] or row["dimension"] != len(query_vector):
+                continue
+            similarity = vector_memory.cosine(row["vector"], query_vector)
+            if similarity is not None and similarity > 0:
+                winners.append((similarity, row, chapter))
+        winners.sort(key=lambda item: item[0], reverse=True)
+        results = []
+        seen = set()
+        for score, row, chapter in winners:
+            marker = (row["document_id"], row["chapter_title"], row["part"])
+            if marker in seen:
+                continue
+            seen.add(marker)
+            start, end = row["char_start"], row["char_end"]
+            results.append({"id": chapter[0], "document_id": row["document_id"], "ord": chapter[1],
+                            "title": row["chapter_title"], "char_start": start, "char_end": end,
+                            "full_char_count": len(chapter[2]), "text": chapter[2][start:end],
+                            "score": round(score, 4), "source_vector": True})
+            if len(results) >= top_k:
+                break
+        return results
+
+
+def search_summary_vectors(archive_id: int, query: str, top_k: int = 8, max_ord: int = -1) -> List[Dict]:
+    with connect_db() as conn:
+        if get_archive_setting(conn, archive_id, "vector_enabled", "0") != "1":
+            return []
+        backend = get_archive_setting(conn, archive_id, "vector_backend", "builtin")
+        model = get_archive_setting(conn, archive_id, "vector_model")
+        base_url = get_archive_setting(conn, archive_id, "vector_base_url", vector_memory.DEFAULT_SERVICE_URL)
+        online_source = get_archive_setting(conn, archive_id, "vector_online_source", "custom")
+        base_url, api_key = resolve_vector_credentials(conn, backend, online_source, base_url)
+        try:
+            key = vector_memory.model_key(backend, model, base_url)
+        except ValueError:
+            return []
+    query_vector = vector_memory.embed_with(backend, [query[:600]], model, base_url, api_key)[0]
+    with connect_db() as conn:
+        cutoff_clause = " AND c.ord<=?" if max_ord >= 0 else ""
+        args = [archive_id, key] + ([max_ord] if max_ord >= 0 else [])
+        rows = conn.execute(
+            "SELECT v.chunk_id,v.vector,v.summary_hash,s.content,c.document_id,c.ord,c.title "
+            "FROM summary_vectors v JOIN chunks c ON c.id=v.chunk_id "
+            "JOIN summaries s ON s.archive_id=v.archive_id AND s.scope='chapter' AND s.source_key=v.source_key "
+            "WHERE v.archive_id=? AND v.model=?" + cutoff_clause,
+            args,
+        ).fetchall()
+        stale = {(int(item["document_id"]), item["title"]) for item in conn.execute(
+            "SELECT document_id,title FROM chapter_source_edits WHERE archive_id=? AND needs_resummary=1", (archive_id,)
+        ).fetchall()}
+    best = {}
+    hashes = {}
+    for row in rows:
+        if (int(row["document_id"]), row["title"]) in stale:
+            continue
+        key = row["chunk_id"]
+        if key not in hashes:
+            hashes[key] = vector_memory.digest(row["content"])
+        if hashes[key] != row["summary_hash"] or is_summary_missing_or_incomplete(row["content"]):
+            continue
+        similarity = vector_memory.cosine(row["vector"], query_vector)
+        if similarity is None or similarity <= 0:
+            continue
+        if key not in best or similarity > best[key][0]:
+            best[key] = (similarity, row)
+    winners = sorted(best.values(), key=lambda pair: pair[0], reverse=True)[:top_k]
+    if not winners:
+        return []
+    with connect_db() as conn:
+        ids = [row["chunk_id"] for _score, row in winners]
+        placeholders = ",".join("?" for _ in ids)
+        source_rows = conn.execute(
+            f"SELECT id,text,char_start,char_end FROM chunks WHERE id IN ({placeholders})", ids
+        ).fetchall()
+    sources = {row["id"]: row for row in source_rows}
+    results = []
+    for score, row in winners:
+        source = sources.get(row["chunk_id"])
+        if source is None:
+            continue
+        results.append({
+            "id": row["chunk_id"], "document_id": row["document_id"], "ord": row["ord"],
+            "title": row["title"], "char_start": source["char_start"], "char_end": source["char_end"],
+            "full_char_count": len(source["text"] or ""),
+            "text": excerpt_for_query(source["text"] or "", query), "score": round(score, 4),
+        })
+    return results
 
 
 def set_job(job_id: str, **kwargs) -> None:
@@ -1516,6 +1722,161 @@ def normalize_chapter_selector(chapters: List[Dict]) -> set:
     return selected
 
 
+def resolve_vector_credentials(conn: sqlite3.Connection, backend: str, online_source: str,
+                               base_url: str) -> Tuple[str, str]:
+    if backend != "online":
+        return base_url, ""
+    if online_source in {"siliconflow", "openrouter"}:
+        provider = get_provider_config(conn, online_source)
+        return provider["base_url"], provider["api_key"]
+    if online_source != "custom":
+        raise ValueError("此聊天渠道尚未确认支持向量嵌入接口；请选择硅基流动、OpenRouter 或自定义")
+    return base_url, get_setting(conn, "vector_online_api_key")
+
+
+def index_summary_vectors(archive_id: int, backend: str = "builtin", model: str = "",
+                          base_url: str = "", online_source: str = "custom",
+                          progress=None, should_pause=None) -> Dict:
+    """Build a resumable local embedding index; never calls a paid chat API."""
+    with connect_db() as conn:
+        effective_url, api_key = resolve_vector_credentials(conn, backend, online_source, base_url)
+        key = vector_memory.model_key(backend, model, effective_url)
+        rows = conn.execute(
+            "SELECT s.source_key,s.content,c.id AS chunk_id FROM summaries s "
+            "JOIN chunks c ON s.source_key=('doc:' || c.document_id || ':chapter:' || c.title) "
+            "WHERE s.archive_id=? AND s.scope='chapter' AND c.archive_id=? ORDER BY c.document_id,c.ord",
+            (archive_id, archive_id),
+        ).fetchall()
+        existing = conn.execute(
+            "SELECT chunk_id,part,summary_hash FROM summary_vectors WHERE archive_id=? AND model=?",
+            (archive_id, key),
+        ).fetchall()
+        stale = {(int(row["document_id"]), row["title"]) for row in conn.execute(
+            "SELECT document_id,title FROM chapter_source_edits WHERE archive_id=? AND needs_resummary=1", (archive_id,)
+        ).fetchall()}
+    known = {}
+    for item in existing:
+        known.setdefault(item["chunk_id"], {})[item["part"]] = item["summary_hash"]
+    pending = []
+    valid = 0
+    for row in rows:
+        if is_summary_missing_or_incomplete(row["content"]):
+            continue
+        source_key = row["source_key"]
+        # Edited source text is not indexed until its chapter memory is repaired.
+        document_id = int(source_key.split(":", 2)[1])
+        title = source_key.split(":chapter:", 1)[1]
+        if (document_id, title) in stale:
+            continue
+        valid += 1
+        summary_hash = vector_memory.digest(row["content"])
+        segments = vector_memory.parts(row["content"])
+        cached = known.get(row["chunk_id"], {})
+        if len(cached) == len(segments) and all(cached.get(i) == summary_hash for i in range(len(segments))):
+            continue
+        for part, segment in enumerate(segments):
+            pending.append((row["chunk_id"], source_key, part, summary_hash, segment))
+    if not valid:
+        raise ValueError("当前知识库没有可向量化的完整章节总结；请先补齐总结")
+    total = len(pending)
+    completed = 0
+    for start in range(0, total, 12):
+        if should_pause and should_pause():
+            raise InterruptedError("向量化已暂停；已完成部分会保留，下次可续建")
+        batch = pending[start:start + 12]
+        vectors = vector_memory.embed_with(backend, [item[4] for item in batch], model, effective_url, api_key)
+        with connect_db() as conn:
+            for item, vector in zip(batch, vectors):
+                chunk_id, source_key, part, summary_hash, _segment = item
+                conn.execute(
+                    "INSERT INTO summary_vectors(archive_id,chunk_id,source_key,part,model,summary_hash,dimension,vector) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(archive_id,chunk_id,part,model) "
+                    "DO UPDATE SET source_key=excluded.source_key,summary_hash=excluded.summary_hash,"
+                    "dimension=excluded.dimension,vector=excluded.vector",
+                    (archive_id, chunk_id, source_key, part, key, summary_hash, len(vector), vector_memory.pack(vector)),
+                )
+        completed += len(batch)
+        if progress:
+            progress(completed, total)
+    with connect_db() as conn:
+        conn.execute("INSERT INTO archive_settings(archive_id,key,value) VALUES(?,'vector_enabled','1') "
+                     "ON CONFLICT(archive_id,key) DO UPDATE SET value='1'", (archive_id,))
+        for setting_key, value in (("vector_backend", backend), ("vector_model", model),
+                                   ("vector_base_url", base_url or vector_memory.DEFAULT_SERVICE_URL),
+                                   ("vector_online_source", online_source), ("vector_index_key", key)):
+            conn.execute("INSERT INTO archive_settings(archive_id,key,value) VALUES(?,?,?) "
+                         "ON CONFLICT(archive_id,key) DO UPDATE SET value=excluded.value", (archive_id, setting_key, value))
+    return {"chapters": valid, "embedded_parts": completed,
+            "skipped_parts": sum(len(value) for value in known.values()),
+            "provider": vector_memory.provider_name() if backend == "builtin" else
+                        ("LM Studio 本机服务" if backend == "lmstudio" else "在线嵌入 API")}
+
+
+def index_source_vectors(archive_id: int, backend: str = "builtin", model: str = "",
+                         base_url: str = "", online_source: str = "custom",
+                         progress=None, should_pause=None) -> Dict:
+    """Index original text chapter by chapter; persist each small API batch."""
+    if backend == "builtin" and not model:
+        model = vector_memory.MODEL_ID
+    with connect_db() as conn:
+        effective_url, api_key = resolve_vector_credentials(conn, backend, online_source, base_url)
+        key = vector_memory.model_key(backend, model, effective_url)
+        chapters = conn.execute(
+            "SELECT document_id,title,MIN(ord) first_ord FROM chunks WHERE archive_id=? "
+            "GROUP BY document_id,title ORDER BY document_id,first_ord", (archive_id,)
+        ).fetchall()
+        known = {}
+        for row in conn.execute(
+            "SELECT document_id,chapter_title,part,source_hash FROM source_vectors "
+            "WHERE archive_id=? AND model=?", (archive_id, key)
+        ):
+            known.setdefault((row["document_id"], row["chapter_title"]), {})[row["part"]] = row["source_hash"]
+        pending = []
+        for chapter in chapters:
+            doc_id, title = chapter["document_id"], chapter["title"]
+            source = get_chapter_source_text(conn, archive_id, doc_id, title)
+            if not source.strip():
+                continue
+            digest = vector_memory.digest(source)
+            parts = vector_memory.source_parts(source)
+            cached = known.get((doc_id, title), {})
+            conn.execute(
+                "DELETE FROM source_vectors WHERE archive_id=? AND document_id=? AND chapter_title=? AND model=? "
+                "AND (source_hash<>? OR part>=?)",
+                (archive_id, doc_id, title, key, digest, len(parts)),
+            )
+            for part, (start, end, text) in enumerate(parts):
+                if cached.get(part) != digest:
+                    pending.append((doc_id, title, part, start, end, digest, text))
+    total = len(pending)
+    for offset in range(0, total, 12):
+        if should_pause and should_pause():
+            raise InterruptedError("原文向量化已暂停；已完成片段保留，可续建")
+        batch = pending[offset:offset + 12]
+        vectors = vector_memory.embed_with(backend, [item[6] for item in batch], model, effective_url, api_key)
+        with connect_db() as conn:
+            for item, vector in zip(batch, vectors):
+                doc_id, title, part, start, end, digest, _ = item
+                conn.execute(
+                    "INSERT INTO source_vectors(archive_id,document_id,chapter_title,part,char_start,char_end,model,source_hash,dimension,vector) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(archive_id,document_id,chapter_title,part,model) "
+                    "DO UPDATE SET char_start=excluded.char_start,char_end=excluded.char_end,source_hash=excluded.source_hash,"
+                    "dimension=excluded.dimension,vector=excluded.vector",
+                    (archive_id, doc_id, title, part, start, end, key, digest, len(vector), vector_memory.pack(vector)),
+                )
+        if progress:
+            progress(min(offset + len(batch), total), total)
+    with connect_db() as conn:
+        for setting_key, value in (("source_vector_enabled", "1"), ("source_vector_backend", backend),
+                                   ("source_vector_model", model), ("source_vector_base_url", effective_url),
+                                   ("source_vector_online_source", online_source), ("source_vector_index_key", key)):
+            conn.execute("INSERT INTO archive_settings(archive_id,key,value) VALUES(?,?,?) "
+                         "ON CONFLICT(archive_id,key) DO UPDATE SET value=excluded.value",
+                         (archive_id, setting_key, value))
+    return {"chapters": len(chapters), "embedded_parts": total,
+            "skipped_parts": sum(len(parts) for parts in known.values())}
+
+
 def build_memory_job(
     job_id: str,
     archive_id: int,
@@ -1524,6 +1885,11 @@ def build_memory_job(
     missing_only: bool = False,
     rebuild_overview: bool = False,
     economy_mode: bool = True,
+    vectorize: bool = False,
+    vector_backend: str = "builtin",
+    vector_model: str = "",
+    vector_base_url: str = "",
+    vector_online_source: str = "custom",
 ) -> None:
     try:
         config = current_config()
@@ -1571,7 +1937,7 @@ def build_memory_job(
                 target_rows.append(row)
             else:
                 skipped += 1
-        if not target_rows and missing_only:
+        if not target_rows and missing_only and not vectorize:
             export_path = export_archive_to_file(archive_id)
             set_job(
                 job_id,
@@ -1584,7 +1950,7 @@ def build_memory_job(
                 skipped=skipped,
             )
             return
-        if not target_rows:
+        if not target_rows and not vectorize:
             export_path = export_archive_to_file(archive_id)
             set_job(
                 job_id,
@@ -1598,7 +1964,7 @@ def build_memory_job(
             )
             return
 
-        total_steps = len(target_rows) + (1 if rebuild_overview else 0)
+        total_steps = len(target_rows) + (1 if rebuild_overview else 0) + (1 if vectorize else 0)
         done = 0
         succeeded = 0
         failed = 0
@@ -1681,6 +2047,47 @@ def build_memory_job(
                     export_path=export_path, succeeded=succeeded, failed=failed, failures=failures[-50:])
             return
 
+        vector_result = None
+        source_result = None
+        vector_error = ""
+        if vectorize:
+            try:
+                set_job(job_id, stage="双层向量化", done=done, total=total_steps,
+                        message="正在建立章节记忆与原文片段索引；不会重新总结原文")
+                try:
+                    vector_result = index_summary_vectors(
+                        archive_id, backend=vector_backend, model=vector_model,
+                        base_url=vector_base_url, online_source=vector_online_source,
+                        progress=lambda completed, total: set_job(
+                            job_id, stage="双层向量化", done=done, total=total_steps,
+                            message=f"章节记忆向量：{completed}/{total} 片段"),
+                        should_pause=lambda: memory_pause_requested(job_id),
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    vector_error = "章节记忆：" + str(exc)
+                source_result = index_source_vectors(
+                    archive_id, backend=vector_backend, model=vector_model,
+                    base_url=vector_base_url, online_source=vector_online_source,
+                    progress=lambda completed, total: set_job(
+                        job_id, stage="双层向量化", done=done, total=total_steps,
+                        message=f"原文向量：{completed}/{total} 片段（逐批保存）"),
+                    should_pause=lambda: memory_pause_requested(job_id),
+                )
+                done += 1
+            except InterruptedError as exc:
+                export_path = export_archive_to_file(archive_id)
+                set_job(job_id, status="paused", stage="已暂停", done=done,
+                        message=f"{exc}；已完成的总结和向量片段已保存。知识库已导出：{export_path}",
+                        export_path=export_path, succeeded=succeeded, failed=failed, failures=failures[-50:])
+                return
+            except Exception as exc:
+                vector_error += ("；" if vector_error else "") + "原文：" + str(exc)
+                done += 1
+                set_job(job_id, stage="双层向量化", done=done, total=total_steps,
+                        message=f"向量化失败：{vector_error}；章节总结已保留，原关键词检索仍可使用")
+
         archive_error = ""
         with connect_db() as conn:
             summary_rows = conn.execute(
@@ -1732,6 +2139,12 @@ def build_memory_job(
             result_message += f"；全书总览生成失败（可稍后续建）：{archive_error}"
         else:
             result_message += "；全书总览已生成"
+        if vector_result:
+            result_message += f"；章节记忆已向量化 {vector_result['chapters']} 章"
+        if source_result:
+            result_message += f"；原文新增向量 {source_result['embedded_parts']} 片段"
+        if vector_error:
+            result_message += f"；向量化未完成：{vector_error}"
         result_message += f"；已导出知识库文件：{export_path}"
         set_job(
             job_id,
@@ -1746,6 +2159,8 @@ def build_memory_job(
             failed=failed,
             failures=failures[-50:],
             archive_error=archive_error,
+            vector_error=vector_error,
+            vector_result=vector_result,
         )
     except Exception as exc:
         set_job(job_id, status="error", error=str(exc), message=str(exc), trace=traceback.format_exc())
@@ -1758,10 +2173,24 @@ def start_memory_build(
     missing_only: bool = False,
     rebuild_overview: bool = False,
     economy_mode: bool = True,
+    vectorize: bool = False,
+    vector_backend: str = "builtin",
+    vector_model: str = "",
+    vector_base_url: str = "",
+    vector_api_key: str = "",
+    vector_online_source: str = "custom",
 ) -> Dict:
     active = active_job_for_archive(archive_id)
     if active:
         return active
+    if not vectorize:
+        with connect_db() as conn:
+            require_archive(conn, archive_id)
+            conn.execute("INSERT INTO archive_settings(archive_id,key,value) VALUES(?,'vector_enabled','0') "
+                         "ON CONFLICT(archive_id,key) DO UPDATE SET value='0'", (archive_id,))
+    if vectorize and vector_backend == "online" and vector_online_source == "custom" and vector_api_key:
+        with connect_db() as conn:
+            save_setting(conn, "vector_online_api_key", vector_api_key.strip())
     job_id = str(uuid.uuid4())
     stamp = now_ts()
     with JOBS_LOCK:
@@ -1780,7 +2209,8 @@ def start_memory_build(
     set_job(job_id)
     thread = threading.Thread(
         target=build_memory_job,
-        args=(job_id, archive_id, force, chapters_filter or [], missing_only, rebuild_overview, economy_mode),
+        args=(job_id, archive_id, force, chapters_filter or [], missing_only, rebuild_overview,
+              economy_mode, vectorize, vector_backend, vector_model, vector_base_url, vector_online_source),
         daemon=True,
     )
     thread.start()
@@ -1797,9 +2227,34 @@ def export_archive(archive_id: int) -> Dict:
         tags = conn.execute("SELECT id, name, color, recognition_prompt FROM special_tags WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()
         hits = conn.execute("SELECT tag_id, document_id, chapter_title, description, evidence, source FROM special_tag_hits WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()
         source_edits = conn.execute("SELECT document_id, title, edited_at, needs_resummary FROM chapter_source_edits WHERE archive_id=? ORDER BY document_id, title", (archive_id,)).fetchall()
+        epub_images = conn.execute("SELECT document_id,image_ord,filename,mime,content FROM epub_images WHERE archive_id=? ORDER BY document_id,image_ord", (archive_id,)).fetchall()
+        source_index = {"backend": get_archive_setting(conn, archive_id, "source_vector_backend", ""),
+                        "provider": get_archive_setting(conn, archive_id, "source_vector_online_source", ""),
+                        "model": get_archive_setting(conn, archive_id, "source_vector_model", ""),
+                        "records": []}
+        index_key = get_archive_setting(conn, archive_id, "source_vector_index_key", "")
+        if index_key:
+            source_hashes = {}
+            for row in conn.execute(
+                "SELECT document_id,chapter_title,part,char_start,char_end,source_hash,dimension,vector "
+                "FROM source_vectors WHERE archive_id=? AND model=? ORDER BY document_id,chapter_title,part",
+                (archive_id, index_key),
+            ):
+                chapter_key = (row["document_id"], row["chapter_title"])
+                if chapter_key not in source_hashes:
+                    source_hashes[chapter_key] = vector_memory.digest(
+                        get_chapter_source_text(conn, archive_id, *chapter_key))
+                if source_hashes[chapter_key] != row["source_hash"]:
+                    continue
+                source_index["records"].append({
+                    "document_id": row["document_id"], "chapter_title": row["chapter_title"],
+                    "part": row["part"], "char_start": row["char_start"], "char_end": row["char_end"],
+                    "source_hash": row["source_hash"], "dimension": row["dimension"],
+                    "vector_base64": base64.b64encode(row["vector"]).decode("ascii"),
+                })
     return {
         "format": "novel-memory-archive",
-        "version": 4,
+        "version": 5,
         "exported_at": now_ts(),
         "archive": detail["archive"],
         "documents": detail["documents"],
@@ -1810,6 +2265,11 @@ def export_archive(archive_id: int) -> Dict:
         "special_tags": [dict(row) for row in tags],
         "special_tag_hits": [dict(row) for row in hits],
         "chapter_source_edits": [dict(row) for row in source_edits],
+        "source_vector_index": source_index,
+        "epub_images": [{"document_id": row["document_id"], "image_ord": row["image_ord"],
+                         "filename": row["filename"], "mime": row["mime"],
+                         "content_base64": base64.b64encode(row["content"]).decode("ascii")}
+                        for row in epub_images],
     }
 
 
@@ -1835,6 +2295,8 @@ def import_archive_package(package: Dict) -> int:
     tags = package.get("special_tags") or []
     hits = package.get("special_tag_hits") or []
     source_edits = package.get("chapter_source_edits") or []
+    source_index = package.get("source_vector_index") or {}
+    epub_images = package.get("epub_images") or []
     archive_id = create_archive((archive.get("name") or "导入的知识库") + "（导入）", archive.get("description") or "")
     doc_id_map = {}
     tag_id_map = {}
@@ -1857,6 +2319,17 @@ def import_archive_package(package: Dict) -> int:
                 ),
             )
             doc_id_map[int(doc.get("id") or len(doc_id_map) + 1)] = int(cur.lastrowid)
+        for image in epub_images:
+            old_doc = int(image.get("document_id") or 0)
+            document_id = doc_id_map.get(old_doc) or next(iter(doc_id_map.values()), 0)
+            if not document_id:
+                continue
+            content = base64.b64decode(image.get("content_base64") or "", validate=True)
+            if not content or len(content) > 15_000_000:
+                raise ValueError("EPUB 插图为空或超过 15 MB")
+            conn.execute("INSERT INTO epub_images(archive_id,document_id,image_ord,filename,mime,content) VALUES(?,?,?,?,?,?)",
+                         (archive_id, document_id, int(image.get("image_ord") or 0),
+                          str(image.get("filename") or "image"), str(image.get("mime") or "image/jpeg"), content))
         for chunk in chunks:
             document_id = doc_id_map.get(int(chunk.get("document_id") or 0)) or next(iter(doc_id_map.values()), 0)
             terms = limited_terms(chunk.get("text") or "")
@@ -1951,6 +2424,46 @@ def import_archive_package(package: Dict) -> int:
                     "INSERT OR REPLACE INTO chapter_source_edits(archive_id, document_id, title, edited_at, needs_resummary) VALUES(?, ?, ?, ?, ?)",
                     (archive_id, document_id, title, int(item.get("edited_at") or now_ts()), int(item.get("needs_resummary", 1))),
                 )
+        backend = str(source_index.get("backend") or "")
+        provider = str(source_index.get("provider") or "")
+        model = str(source_index.get("model") or "")[:180]
+        records = source_index.get("records") or []
+        if model and isinstance(records, list) and backend in {"builtin", "lmstudio", "online"}:
+            portable_key = "portable:" + provider + ":" + model
+            chapter_hashes = {}
+            imported = 0
+            for record in records:
+                old_doc = int(record.get("document_id") or 0)
+                document_id = doc_id_map.get(old_doc)
+                title = str(record.get("chapter_title") or "")
+                if not document_id or not title:
+                    continue
+                chapter_key = (document_id, title)
+                if chapter_key not in chapter_hashes:
+                    chapter_hashes[chapter_key] = vector_memory.digest(
+                        get_chapter_source_text(conn, archive_id, document_id, title))
+                if chapter_hashes[chapter_key] != record.get("source_hash"):
+                    continue
+                dimension = int(record.get("dimension") or 0)
+                blob = base64.b64decode(record.get("vector_base64") or "", validate=True)
+                start, end = int(record.get("char_start") or 0), int(record.get("char_end") or 0)
+                if not 0 < dimension <= 8192 or len(blob) != dimension * 4 or not 0 <= start < end:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO source_vectors(archive_id,document_id,chapter_title,part,char_start,char_end,model,source_hash,dimension,vector) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (archive_id, document_id, title, int(record.get("part") or 0), start, end,
+                     portable_key, record["source_hash"], dimension, blob),
+                )
+                imported += 1
+            if imported:
+                enabled = backend != "online" or provider in {"siliconflow", "openrouter"}
+                for setting_key, value in (("source_vector_enabled", "1" if enabled else "0"),
+                                           ("source_vector_backend", backend), ("source_vector_model", model),
+                                           ("source_vector_online_source", provider),
+                                           ("source_vector_index_key", portable_key)):
+                    conn.execute("INSERT OR REPLACE INTO archive_settings(archive_id,key,value) VALUES(?,?,?)",
+                                 (archive_id, setting_key, value))
     return archive_id
 
 
@@ -3483,7 +3996,12 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def estimate_messages_tokens(messages: List[Dict]) -> int:
-    return sum(estimate_text_tokens(item.get("content", "")) + 12 for item in messages) + 16
+    def content_tokens(content):
+        if isinstance(content, list):
+            return sum(estimate_text_tokens(part.get("text", "")) if part.get("type") == "text" else 1200
+                       for part in content if isinstance(part, dict))
+        return estimate_text_tokens(content)
+    return sum(content_tokens(item.get("content", "")) + 12 for item in messages) + 16
 
 
 def trim_text_to_token_budget(text: str, token_budget: int) -> str:
@@ -3767,6 +4285,80 @@ def save_config(payload: Dict) -> Dict:
         for key, value in global_values.items():
             save_setting(conn, key, str(value))
     return {**public_provider_config(provider_values), "provider": provider, **global_values}
+
+
+TRANSFER_GLOBAL_KEYS = (
+    "username", "theme", "summary_prompt", "summary_max_chars", "chat_prompt",
+    "roleplay_prompt", "rewrite_global_prompt", "rewrite_max_tokens",
+    "rewrite_continue_calls", "rewrite_budget_tokens", "special_tag_expand_prompt",
+    "rewrite_expand_prompt",
+)
+
+
+def export_settings_bundle(include_keys: bool = False) -> Dict:
+    with connect_db() as conn:
+        selected = get_setting(conn, "provider", "lmstudio")
+        globals_payload = {key: get_setting(conn, key, str(DEFAULT_PROMPTS.get(key, "")))
+                           for key in TRANSFER_GLOBAL_KEYS}
+        globals_payload["user_name"] = globals_payload["username"]
+        providers = {name: get_provider_config(conn, name) for name in PROVIDER_PRESETS}
+        if include_keys:
+            globals_payload["brave_search_key"] = get_setting(conn, "brave_search_key", "")
+        globals_payload["web_search_enabled"] = get_setting(conn, "web_search_enabled", "0")
+    if not include_keys:
+        for provider in providers.values():
+            provider.pop("api_key", None)
+    return {"format": "pardo-settings-bundle", "version": 1, "contains_secrets": include_keys,
+            "selected_provider": selected, "providers": providers, "globals": globals_payload}
+
+
+def import_settings_bundle(bundle: Dict, allow_keys: bool = False) -> Dict:
+    if not isinstance(bundle, dict) or bundle.get("format") != "pardo-settings-bundle" or bundle.get("version") != 1:
+        raise ValueError("不是帕朵一号设置配置文件 v1")
+    if len(json.dumps(bundle, ensure_ascii=False)) > 2_000_000:
+        raise ValueError("设置配置文件超过 2 MB")
+    providers, globals_payload = bundle.get("providers"), bundle.get("globals")
+    if not isinstance(providers, dict) or not isinstance(globals_payload, dict):
+        raise ValueError("设置配置缺少渠道或全局配置")
+    if (bundle.get("contains_secrets") or any(isinstance(row, dict) and row.get("api_key") for row in providers.values())
+            or globals_payload.get("brave_search_key")) and not allow_keys:
+        raise ValueError("文件包含 API / 搜索密钥；请明确勾选允许导入密钥")
+    # Validate every field before changing either SQLite or the per-provider JSON files.
+    for key in (*TRANSFER_GLOBAL_KEYS, "user_name", "brave_search_key"):
+        if key in globals_payload and len(str(globals_payload[key])) > 50000:
+            raise ValueError(key + " 超出长度限制")
+    for name, values in providers.items():
+        if name not in PROVIDER_PRESETS or not isinstance(values, dict):
+            raise ValueError("无效的 API 渠道配置：" + str(name))
+        for key in ("base_url", "chat_model", "temperature", "max_tokens", "top_k", "api_key"):
+            if key in values and len(str(values[key])) > 50000:
+                raise ValueError(name + "." + key + " 超出长度限制")
+    selected = bundle.get("selected_provider")
+    if selected and selected not in PROVIDER_PRESETS:
+        raise ValueError("未知的默认 API 渠道")
+    changed_providers = {}
+    with connect_db() as conn:
+        for name, values in providers.items():
+            existing = get_provider_config(conn, name)
+            fields = {key: values[key] for key in ("base_url", "chat_model", "temperature", "max_tokens", "top_k") if key in values}
+            fields["api_key"] = str(values.get("api_key") or "") if allow_keys and values.get("api_key") else existing.get("api_key", "")
+            changed_providers[name] = upsert_provider_config(conn, name, {**existing, **fields}, write_file=False)
+        for key in TRANSFER_GLOBAL_KEYS:
+            if key in globals_payload:
+                value = str(globals_payload[key])
+                save_setting(conn, key, value)
+        if "username" not in globals_payload and "user_name" in globals_payload:
+            save_setting(conn, "username", str(globals_payload["user_name"])[:50000])
+        if "web_search_enabled" in globals_payload:
+            save_setting(conn, "web_search_enabled", "1" if str(globals_payload["web_search_enabled"]) in {"1", "true", "True"} else "0")
+        if allow_keys and globals_payload.get("brave_search_key"):
+            save_setting(conn, "brave_search_key", str(globals_payload["brave_search_key"]))
+        if selected in PROVIDER_PRESETS:
+            save_setting(conn, "provider", selected)
+    for name, values in changed_providers.items():
+        write_provider_config_file(name, values)
+    return {"providers": len([name for name in providers if name in PROVIDER_PRESETS]),
+            "included_keys": bool(allow_keys and bundle.get("contains_secrets"))}
 
 
 def get_chat_preset(archive_id: int) -> Dict:
@@ -4069,6 +4661,7 @@ def answer_question_with_memory(
     replace_after_user_id: int = 0,
     target_assistant_id: int = 0,
     edit_user_id: int = 0,
+    image_url: str = "",
 ) -> Dict:
     session = ensure_conversation_session(archive_id, "qa", 0, session_id)
     session_id = int(session["id"])
@@ -4134,9 +4727,13 @@ def answer_question_with_memory(
                 params,
             ).fetchall()
         history = [dict(row) for row in reversed(rows)]
+    if image_url:
+        config["_single_request"] = True
+        config["_preserve_input"] = True
+    user_content = ([{"type": "text", "text": user_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]
+                    if image_url else user_prompt)
     answer = call_chat_api(
-        [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": user_prompt}],
-        config,
+        [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": user_content}], config,
     )
     stamp = now_ts()
     with connect_db() as conn:
@@ -4559,6 +5156,7 @@ def answer_roleplay(
     target_assistant_id: int = 0,
     edit_user_id: int = 0,
     preserve_timeline_after: int = -1,
+    image_url: str = "",
 ) -> Dict:
     if not user_text.strip():
         raise ValueError("请输入角色扮演内容")
@@ -4645,7 +5243,12 @@ def answer_roleplay(
         profile,
         config.get("roleplay_prompt") or DEFAULT_PROMPTS["roleplay_prompt"],
     )
-    messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": user_prompt}]
+    if image_url:
+        config["_single_request"] = True
+        config["_preserve_input"] = True
+    user_content = ([{"type": "text", "text": user_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]
+                    if image_url else user_prompt)
+    messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": user_content}]
     raw_answer = call_chat_api(messages, config)
     repetition_score = roleplay_repetition_score(raw_answer, recent_assistant)
     repetition_retried = False
@@ -4657,7 +5260,7 @@ def answer_roleplay(
             "不得沿用草稿中的句子、动作顺序或开头，必须让场景产生新的可观察变化，同时继续遵守原著路线和隐藏进度协议。"
         )
         raw_answer = call_chat_api(
-            [{"role": "system", "content": retry_prompt}, *history, {"role": "user", "content": user_prompt}],
+            [{"role": "system", "content": retry_prompt}, *history, {"role": "user", "content": user_content}],
             config,
         )
         repetition_score = roleplay_repetition_score(raw_answer, recent_assistant)
@@ -5151,6 +5754,97 @@ def read_json(handler: BaseHTTPRequestHandler) -> Dict:
     return json.loads(raw.decode("utf-8"))
 
 
+def validated_chat_image(value: str) -> str:
+    if not value:
+        return ""
+    if not isinstance(value, str) or len(value) > 8_000_000:
+        raise ValueError("图片超过 6 MB，请选择较小的图片")
+    match = re.fullmatch(r"data:image/(jpeg|png|webp|gif);base64,([A-Za-z0-9+/]+={0,2})", value)
+    if not match:
+        raise ValueError("仅支持 JPEG、PNG、WebP、GIF 图片")
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except Exception as exc:
+        raise ValueError("图片数据损坏") from exc
+    if not raw or len(raw) > 6_000_000:
+        raise ValueError("图片超过 6 MB")
+    mime = match.group(1)
+    signatures = {"jpeg": raw.startswith(b"\xff\xd8\xff"), "png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+                  "webp": raw.startswith(b"RIFF") and raw[8:12] == b"WEBP", "gif": raw.startswith((b"GIF87a", b"GIF89a"))}
+    if not signatures[mime]:
+        raise ValueError("图片内容与格式不匹配")
+    return value
+
+
+def background_image_path() -> str:
+    return os.path.join(data_dir(), "ui-background-image.txt")
+
+
+def load_background_image() -> str:
+    try:
+        with open(background_image_path(), "r", encoding="ascii") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def save_background_image(value: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError("背景图片格式无效")
+    validated_chat_image(value)
+    target = background_image_path()
+    temporary = target + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(temporary, "w", encoding="ascii") as handle:
+            handle.write(value)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def clear_background_image() -> None:
+    try:
+        os.remove(background_image_path())
+    except FileNotFoundError:
+        pass
+
+
+def ui_appearance_path() -> str:
+    return os.path.join(data_dir(), "ui-appearance.json")
+
+
+def load_ui_appearance() -> Dict:
+    try:
+        with open(ui_appearance_path(), "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        return stored if isinstance(stored, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_ui_appearance(payload: Dict) -> Dict:
+    result = {}
+    for group, low, high in (("alpha", 20, 100), ("blur", 0, 24)):
+        values = payload.get(group, {})
+        if not isinstance(values, dict):
+            raise ValueError("界面外观配置无效")
+        result[group] = {
+            name: max(low, min(high, int(values[name])))
+            for name in ("nav", "chat", "panel", "input") if name in values
+        }
+    target = ui_appearance_path()
+    temporary = target + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return result
+
+
 def send_json(handler: BaseHTTPRequestHandler, payload, status: int = 200) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -5169,6 +5863,13 @@ def send_text(handler: BaseHTTPRequestHandler, text: str, status: int = 200, con
     handler.wfile.write(data)
 
 
+def call_generation_model(messages: List[Dict], output_tokens: int) -> str:
+    config = {**current_config(), "max_tokens": output_tokens,
+              "_ensure_final_answer": True, "_disable_thinking": True,
+              "_require_complete": True}
+    return call_chat_api(messages, config, timeout=240)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"{APP_NAME}/{APP_VERSION}"
 
@@ -5179,6 +5880,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/" or self.path.startswith("/?"):
                 send_text(self, UI_HTML)
+            elif self.path == "/api/ui/background":
+                send_json(self, {"image": load_background_image()})
+            elif self.path == "/api/ui/appearance":
+                send_json(self, load_ui_appearance())
+            elif self.path == "/api/generation/projects":
+                send_json(self, {"projects": generation_revision.list_projects(data_dir())})
+            elif self.path == "/api/generation/writing_profiles":
+                send_json(self, {"profiles": writing_prompt_profiles.list_profiles(data_dir())})
+            elif self.path.startswith("/api/generation/chapter/"):
+                parts = self.path.split("/")
+                project_id, number = parts[4], parts[5]
+                send_json(self, {"chapter": generation_revision.get_chapter(data_dir(), project_id, int(number))})
+            elif self.path.startswith("/api/generation/project/"):
+                project_id = self.path.rsplit("/", 1)[-1]
+                send_json(self, {"project": generation_revision.get_project(data_dir(), project_id)})
             elif self.path == "/api/state":
                 config = current_config()
                 send_json(self, {
@@ -5214,6 +5930,10 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/rewrite/projects/"):
                 archive_id = int(self.path.rsplit("/", 1)[-1])
                 send_json(self, {"projects": storyline.list_projects(db_path(), archive_id)})
+            elif self.path.startswith("/api/transfer/options/"):
+                archive_id = int(self.path.rsplit("/", 1)[-1])
+                send_json(self, {"templates": list_rewrite_templates(archive_id),
+                                 "profiles": list_roleplay_profiles(archive_id)})
             elif self.path.startswith("/api/rewrite/project/"):
                 from urllib.parse import parse_qs, urlsplit
                 parsed = urlsplit(self.path)
@@ -5260,6 +5980,18 @@ class Handler(BaseHTTPRequestHandler):
                     int(query.get("document_id", [0])[0]),
                     str(query.get("title", [""])[0]),
                 ))
+            elif self.path.startswith("/api/epub_images/"):
+                archive_id = int(self.path.rsplit("/", 1)[-1])
+                with connect_db() as conn:
+                    rows = conn.execute("SELECT id, filename, mime FROM epub_images WHERE archive_id=? ORDER BY document_id, image_ord", (archive_id,)).fetchall()
+                send_json(self, {"images": [dict(row) for row in rows]})
+            elif self.path.startswith("/api/epub_image/"):
+                image_id = int(self.path.rsplit("/", 1)[-1])
+                with connect_db() as conn:
+                    row = conn.execute("SELECT mime, content FROM epub_images WHERE id=?", (image_id,)).fetchone()
+                if not row:
+                    raise ValueError("图片不存在")
+                send_json(self, {"data_url": "data:" + row["mime"] + ";base64," + base64.b64encode(row["content"]).decode("ascii")})
             elif self.path.startswith("/api/prompt_templates"):
                 from urllib.parse import parse_qs, urlsplit
                 archive_id = int(parse_qs(urlsplit(self.path).query).get("archive_id", [0])[0])
@@ -5271,8 +6003,81 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/ui/background" and int(self.headers.get("Content-Length", "0")) > 8_100_000:
+                send_json(self, {"error": "背景图片超过 6 MB"}, 413)
+                return
+            if self.path == "/api/generation/synthesize_writing_prompt" and int(self.headers.get("Content-Length", "0")) > 35_000_000:
+                send_json(self, {"error": "参考书上传超过 35 MB；请减少文件或选择较小 EPUB"}, 413)
+                return
             payload = read_json(self)
-            if self.path == "/api/client/heartbeat":
+            if self.path == "/api/ui/background":
+                image = payload.get("image", "")
+                if image:
+                    save_background_image(image)
+                else:
+                    clear_background_image()
+                send_json(self, {"ok": True})
+            elif self.path == "/api/ui/appearance":
+                send_json(self, save_ui_appearance(payload))
+            elif self.path == "/api/generation/import":
+                raw = base64.b64decode(payload.get("content_base64", ""), validate=True)
+                send_json(self, {"project": generation_revision.import_project(data_dir(), raw)})
+            elif self.path == "/api/transfer/settings/export":
+                send_json(self, {"bundle": export_settings_bundle(bool(payload.get("include_keys")))})
+            elif self.path == "/api/transfer/settings/import":
+                send_json(self, {"result": import_settings_bundle(payload.get("bundle") or {}, bool(payload.get("allow_keys")))})
+            elif self.path == "/api/generation/create":
+                send_json(self, {"project": generation_revision.create_project(data_dir(), payload)})
+            elif self.path == "/api/generation/synthesize_writing_prompt":
+                incoming_books = payload.get("books")
+                if not isinstance(incoming_books, list) or not 1 <= len(incoming_books) <= writing_prompt_profiles.MAX_BOOKS:
+                    raise ValueError("请导入 1–5 本参考书")
+                books = []
+                for item in incoming_books:
+                    if not isinstance(item, dict):
+                        raise ValueError("参考书格式无效")
+                    name = str(item.get("name") or "")
+                    if name.lower().endswith(".epub"):
+                        raw = base64.b64decode(item.get("content_base64") or "", validate=True)
+                        if len(raw) > 25_000_000:
+                            raise ValueError("单本 EPUB 超过 25 MB")
+                        content = epub_import.extract_epub(raw, 35_000_000)
+                    else:
+                        content = str(item.get("sample") or "")
+                        if len(content) > writing_prompt_profiles.MAX_SAMPLE + 100:
+                            raise ValueError("请仅上传本地抽样片段，避免整本书进入 API")
+                    books.append({"name": name, "text": content})
+                send_json(self, {"result": writing_prompt_profiles.synthesize(books, call_generation_model)})
+            elif self.path == "/api/generation/writing_profile_save":
+                send_json(self, {"profile": writing_prompt_profiles.save(data_dir(), payload.get("profile"))})
+            elif self.path == "/api/generation/writing_profile_apply":
+                profile = writing_prompt_profiles.get(data_dir(), payload.get("profile_id"))
+                project = generation_revision.update_project(data_dir(), payload.get("project_id"),
+                    {"style": profile["style_prompt"], "generation_prompt": profile["unified_prompt"]})
+                send_json(self, {"project": project})
+            elif self.path == "/api/generation/update":
+                send_json(self, {"project": generation_revision.update_project(data_dir(), payload["id"], payload["changes"])})
+            elif self.path == "/api/generation/plan":
+                send_json(self, {"project": generation_revision.save_plan(data_dir(), payload["id"], payload["plan"])})
+            elif self.path == "/api/generation/start":
+                send_json(self, {"project": generation_revision.start_one(data_dir(), payload["id"], call_generation_model)})
+            elif self.path == "/api/generation/pause":
+                send_json(self, generation_revision.pause(data_dir(), payload["id"]))
+            elif self.path == "/api/generation/save_chapter":
+                chapter = generation_revision.save_chapter(data_dir(), payload["id"], int(payload["number"]),
+                    int(payload["expected_updated_at"]), payload["changes"])
+                send_json(self, {"chapter": chapter})
+            elif self.path == "/api/generation/restore_chapter":
+                chapter = generation_revision.restore_chapter(data_dir(), payload["id"], int(payload["number"]),
+                    int(payload["expected_updated_at"]))
+                send_json(self, {"chapter": chapter})
+            elif self.path == "/api/generation/regenerate_chapter":
+                chapter = generation_revision.regenerate_chapter(data_dir(), payload["id"], int(payload["number"]),
+                    int(payload["expected_updated_at"]), call_generation_model)
+                send_json(self, {"chapter": chapter})
+            elif self.path == "/api/generation/export":
+                send_json(self, {"project": generation_revision.export_project(data_dir(), payload["id"])})
+            elif self.path == "/api/client/heartbeat":
                 tracker = getattr(self.server, "browser_clients", None)
                 if tracker is None:
                     raise ValueError("当前服务未启用浏览器生命周期管理")
@@ -5292,18 +6097,26 @@ class Handler(BaseHTTPRequestHandler):
                 if filename.lower().endswith(".epub"):
                     if not payload.get("content_base64"):
                         raise ValueError("EPUB 必须以文件方式上传")
-                    text = epub_import.extract_epub(base64.b64decode(payload["content_base64"], validate=True), MAX_IMPORT_CHARS)
+                    epub_raw = base64.b64decode(payload["content_base64"], validate=True)
+                    text = epub_import.extract_epub(epub_raw, MAX_IMPORT_CHARS)
                 elif payload.get("content_base64"):
                     text = base64.b64decode(payload["content_base64"]).decode(payload.get("encoding") or "utf-8", errors="replace")
                 else:
                     text = payload.get("text") or ""
                 result = import_document(archive_id, filename, text)
+                if filename.lower().endswith(".epub"):
+                    images = epub_import.extract_epub_images(epub_raw)
+                    with connect_db() as conn:
+                        conn.executemany("INSERT INTO epub_images(archive_id, document_id, image_ord, filename, mime, content) VALUES(?, ?, ?, ?, ?, ?)",
+                            [(archive_id, result["document_id"], index, item["filename"], item["mime"], item["content"]) for index, item in enumerate(images)])
+                    result["images"] = len(images)
                 send_json(self, result)
             elif self.path == "/api/search":
                 send_json(self, {"results": search_chunks(int(payload["archive_id"]), payload.get("query", ""), int(payload.get("top_k") or 8))})
             elif self.path == "/api/chat":
                 send_json(self, answer_question_with_memory(
-                    int(payload["archive_id"]), payload.get("question", "").strip(), int(payload.get("session_id") or 0)
+                    int(payload["archive_id"]), payload.get("question", "").strip(), int(payload.get("session_id") or 0),
+                    image_url=validated_chat_image(payload.get("image_url", ""))
                 ))
             elif self.path == "/api/chat_preset":
                 archive_id = int(payload["archive_id"])
@@ -5363,7 +6176,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/roleplay/chat":
                 send_json(self, answer_roleplay(
                     int(payload["archive_id"]), int(payload["profile_id"]), payload.get("message", "").strip(),
-                    int(payload.get("session_id") or 0)
+                    int(payload.get("session_id") or 0), image_url=validated_chat_image(payload.get("image_url", ""))
                 ))
             elif self.path == "/api/roleplay/clear":
                 send_json(self, clear_roleplay_history(int(payload["profile_id"]), int(payload.get("session_id") or 0)))
@@ -5375,6 +6188,12 @@ class Handler(BaseHTTPRequestHandler):
                     bool(payload.get("missing_only")),
                     bool(payload.get("rebuild_overview")),
                     payload.get("economy_mode") is not False,
+                    bool(payload.get("vectorize")),
+                    str(payload.get("vector_backend") or "builtin"),
+                    str(payload.get("vector_model") or ""),
+                    str(payload.get("vector_base_url") or ""),
+                    str(payload.get("vector_api_key") or ""),
+                    str(payload.get("vector_online_source") or "custom"),
                 )})
             elif self.path == "/api/build_memory/pause":
                 send_json(self, {"job": pause_memory_build(str(payload.get("job_id") or ""), int(payload["archive_id"]))})
@@ -5547,7 +6366,7 @@ UI_HTML = r"""
     }
     button.secondary { background: var(--accent-soft); color: var(--text); }
     button.warn { background: #f1d9d6; color: var(--danger); }
-    button:disabled { opacity: .55; cursor: wait; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
     input, select, textarea {
       width: 100%;
       border: 1px solid var(--line);
@@ -5754,8 +6573,15 @@ UI_HTML = r"""
       border-radius: 10px;
       background: var(--surface);
     }
-    .token-mode-panel label { display: flex; align-items: center; gap: 8px; margin: 0; }
-    .token-mode-panel input { width: auto; }
+    .token-mode-panel .memory-option { display: flex; align-items: flex-start; gap: 10px; margin: 0; cursor: pointer; line-height: 1.45; }
+    .token-mode-panel .memory-option input[type="checkbox"] { width: 18px; height: 18px; min-width: 18px; margin: 2px 0 0; padding: 0; flex: none; cursor: pointer; }
+    .token-mode-panel .memory-option span { min-width: 0; }
+    .token-mode-panel .memory-option small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .vector-channel-config { display: grid; gap: 8px; margin: 2px 0 4px 28px; max-width: 560px; }
+    .vector-channel-config[hidden] { display: none; }
+    .vector-channel-config [hidden] { display: none !important; }
+    .vector-channel-config label { display: grid; gap: 4px; margin: 0; }
+    .vector-channel-config input, .vector-channel-config select { width: 100%; }
     .toast {
       position: fixed;
       left: 50%;
@@ -5858,8 +6684,24 @@ UI_HTML = r"""
               <button class="secondary" id="pauseMemoryBtn" onclick="pauseMemoryBuild()" disabled>暂停总结</button>
             </div>
             <div class="token-mode-panel">
-              <label><input id="economyMode" type="checkbox" checked> 省 Token 模式：每章最多输入约 3200 字，摘要约 380 字</label>
-              <label><input id="rebuildOverview" type="checkbox"> 使用模型重建全书总览（高消耗，默认关闭）</label>
+              <label class="memory-option"><input id="economyMode" type="checkbox" checked><span>省 Token 模式<small>每章最多输入约 3200 字，摘要约 380 字。</small></span></label>
+              <label class="memory-option"><input id="rebuildOverview" type="checkbox"><span>使用模型重建全书总览<small>额外消耗较多 Token；默认关闭。</small></span></label>
+              <label class="memory-option"><input id="vectorizeMemory" type="checkbox" onchange="toggleVectorChannel()"><span>同时建立章节记忆与原文向量索引<small>逐章、分段处理，分别保存并可续建。在线渠道会发送完整原文片段并可能计费；可随知识库 v5 文件导出。</small></span></label>
+              <div id="vectorChannelConfig" class="vector-channel-config" hidden>
+                <label>向量化渠道
+                  <select id="vectorBackend" onchange="toggleVectorChannel()"><option value="builtin">内置模型（离线，显卡优先）</option><option value="lmstudio">LM Studio 本地嵌入模型</option><option value="online">在线嵌入 API（可能收费）</option></select>
+                </label>
+                <div id="vectorServiceFields" class="vector-channel-config" style="margin:0" hidden>
+                  <label id="vectorOnlineSourceLabel" hidden>在线 API 配置
+                    <select id="vectorOnlineSource" onchange="toggleVectorChannel()"><option value="siliconflow">沿用已保存的硅基流动配置</option><option value="openrouter">沿用已保存的 OpenRouter 配置</option><option value="custom">自定义 OpenAI 兼容嵌入 API</option></select>
+                  </label>
+                  <label>嵌入模型 ID<input id="vectorModel" placeholder="填写该渠道的嵌入模型 ID"></label>
+                  <label id="vectorBaseUrlLabel">服务 Base URL<input id="vectorBaseUrl" value="http://127.0.0.1:1234/v1"></label>
+                  <label id="vectorApiKeyLabel" hidden>在线嵌入 API Key<input id="vectorApiKey" type="password" autocomplete="off" placeholder="留空沿用已保存的密钥"></label>
+                  <div id="vectorOnlineNotice" class="meta" hidden>在线渠道会发送章节总结、原文片段和检索问题到所选服务，可能产生资费。聊天模型不能替代嵌入模型；DeepSeek 当前不作为自动复用渠道。</div>
+                </div>
+              </div>
+              <div id="vectorIndexStatus" class="meta">尚未建立向量索引。</div>
             </div>
             <div class="meta" style="margin-top:8px">生成/补齐只调用缺失章节。默认在本地零 Token 聚合全书总览；勾选模型重建才会再次读取所有章节摘要。</div>
             <div class="progress" style="margin-top:12px"><div id="memoryProgress"></div></div>
@@ -5898,7 +6740,9 @@ UI_HTML = r"""
             <div class="bubble assistant">选择知识库后就可以提问。回答会结合全书总览、章节记忆和检索到的原文片段。</div>
           </div>
           <div class="composer">
-            <textarea id="question" placeholder="输入你的问题，或输入角色扮演的台词、动作与场景推进……"></textarea>
+            <div id="chatComposerResize" class="composer-resize" role="separator" aria-label="拖动调整输入框高度" aria-orientation="horizontal"></div>
+            <div class="composer-input"><div id="chatImagePreview" class="chat-image-preview" hidden></div><textarea id="question" placeholder="输入你的问题，或输入角色扮演的台词、动作与场景推进……"></textarea></div>
+            <button class="secondary chat-round-btn" onclick="selectChatImage()" title="添加图片" aria-label="添加图片">+</button>
             <button id="regenerateBtn" class="secondary chat-round-btn" onclick="regenerateLastResponse()" title="刷新上一次回答" aria-label="刷新上一次回答">↻</button>
             <button id="askBtn" onclick="ask()">发送</button>
           </div>
@@ -6085,13 +6929,24 @@ UI_HTML = r"""
           </select>
           <label class="inline" style="margin-top:14px"><input id="navHoverEnabled" type="checkbox" checked onchange="setNavHoverEnabled(this.checked)"> 左侧边缘约 20px 悬停滑出功能栏</label>
           <div class="meta" style="margin-top:4px">关闭后不再自动滑出，功能栏会固定展开，避免失去导航入口。</div>
-          <details class="settings-group"><summary>界面背景与虚化</summary>
+          <details class="settings-group"><summary>界面背景、透明度与虚化</summary>
           <label>自定义背景图片（保存在本机，不上传）</label>
           <input id="appBackgroundInput" type="file" accept="image/*" onchange="setAppBackground(this.files && this.files[0])">
           <div class="row" style="margin-top:10px">
             <button class="secondary" onclick="clearAppBackground()">恢复默认背景</button>
           </div>
           <div class="meta" id="appBackgroundStatus" style="margin-top:8px">当前使用默认背景。</div>
+          <div id="backgroundOpacityControls" style="margin-top:12px">
+            <label>左侧功能栏不透明度 <span id="alphaNavValue">84%</span></label>
+            <input id="alphaNav" type="range" min="20" max="100" step="1" value="84" oninput="setBackgroundAlpha('nav', this.value)">
+            <label>对话区域不透明度 <span id="alphaChatValue">72%</span></label>
+            <input id="alphaChat" type="range" min="20" max="100" step="1" value="72" oninput="setBackgroundAlpha('chat', this.value)">
+            <label>卡片／设置区不透明度 <span id="alphaPanelValue">78%</span></label>
+            <input id="alphaPanel" type="range" min="20" max="100" step="1" value="78" oninput="setBackgroundAlpha('panel', this.value)">
+            <label>输入区不透明度 <span id="alphaInputValue">76%</span></label>
+            <input id="alphaInput" type="range" min="20" max="100" step="1" value="76" oninput="setBackgroundAlpha('input', this.value)">
+            <div class="meta">不透明度与虚化只在使用自定义背景时生效；降低不透明度会让面板更透出背景，建议不低于 45%，以免文字对比不足。</div>
+          </div>
           <div id="backgroundBlurControls" style="margin-top:12px">
             <label>左侧功能栏虚化 <span id="blurNavValue">10px</span></label>
             <input id="blurNav" type="range" min="0" max="24" step="1" value="10" oninput="setBackgroundBlur('nav', this.value)">
@@ -6902,6 +7757,19 @@ function renderMemoryPanel(detail) {
   const archiveSummary = summaries.find(s => s.scope === "archive" && s.source_key === "main");
   $("archiveSummary").textContent = archiveSummary?.content || "尚未生成。";
   $("chatSummary").textContent = archiveSummary?.content || "尚未生成。";
+  const vector = detail?.vector || {};
+  $("vectorizeMemory").checked = !!vector.enabled;
+  $("vectorBackend").value = vector.backend || "builtin";
+  $("vectorModel").value = vector.model || "";
+  $("vectorBaseUrl").value = vector.base_url || "http://127.0.0.1:1234/v1";
+  $("vectorOnlineSource").value = vector.online_source || "custom";
+  $("vectorBackend").dataset.previous = $("vectorBackend").value;
+  $("vectorApiKey").value = "";
+  $("vectorApiKey").placeholder = vector.online_has_key ? "已保存密钥；留空沿用" : "填写在线嵌入 API Key";
+  $("vectorIndexStatus").textContent = (vector.enabled || vector.source_enabled)
+    ? `向量索引：章节记忆 ${fmt(vector.count || 0)} 章 · 原文 ${fmt(vector.source_count || 0)} 片段 · ${vector.backend === "lmstudio" ? "LM Studio" : (vector.backend === "online" ? "在线嵌入 API" : "内置模型")}`
+    : "尚未启用向量检索。";
+  toggleVectorChannel();
   if (detail?.job) renderJob(detail.job);
   else {
     $("memoryProgress").style.width = archiveSummary ? "100%" : "0%";
@@ -6911,6 +7779,24 @@ function renderMemoryPanel(detail) {
     $("pauseMemoryBtn").disabled = true;
     window.activeMemoryJobId = null;
   }
+}
+function toggleVectorChannel() {
+  const enabled = $("vectorizeMemory")?.checked === true;
+  const backend = $("vectorBackend").value;
+  const previous = $("vectorBackend").dataset.previous;
+  if (previous && previous !== backend) {
+    if (backend === "lmstudio" && !$("vectorBaseUrl").value.startsWith("http://")) $("vectorBaseUrl").value = "http://127.0.0.1:1234/v1";
+    if (backend === "online" && $("vectorBaseUrl").value.startsWith("http://")) $("vectorBaseUrl").value = "";
+  }
+  $("vectorBackend").dataset.previous = backend;
+  $("vectorChannelConfig").hidden = !enabled;
+  $("vectorServiceFields").hidden = !enabled || backend === "builtin";
+  const customOnline = backend === "online" && $("vectorOnlineSource").value === "custom";
+  $("vectorOnlineSourceLabel").hidden = backend !== "online";
+  $("vectorBaseUrlLabel").hidden = backend === "online" && !customOnline;
+  $("vectorApiKeyLabel").hidden = !customOnline;
+  $("vectorOnlineNotice").hidden = backend !== "online";
+  $("vectorBaseUrlLabel").firstChild.textContent = backend === "online" ? "在线服务 Base URL" : "本机服务 Base URL";
 }
 function renderJob(job) {
   if (!job) return;
@@ -6969,7 +7855,7 @@ async function importFile() {
       const bytes = new Uint8Array(await file.arrayBuffer());
       let binary = ''; for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
       upload = {archive_id: currentArchiveId, filename: file.name, content_base64: btoa(binary)};
-    } else upload = {archive_id: currentArchiveId, filename: file.name, text: await file.text()};
+    } else upload = {archive_id: currentArchiveId, filename: file.name, text: await decodeNovelText(file)};
     if (status) status.textContent = "导入状态：正在上传并切分章节……";
     const data = await api("/api/import", {method: "POST", body: JSON.stringify(upload)});
     if (status) status.textContent = `导入状态：章节切分完成，${fmt(data.chars)} 字，${fmt(data.chunks)} 章`;
@@ -7007,12 +7893,20 @@ async function refreshArchives() {
 async function buildMemory(force) {
   if (!currentArchiveId) return toast("先选择一个知识库");
   if (force && !confirm("强制重建会重新调用模型生成所有摘要，可能消耗较多时间和 API 额度。继续吗？")) return;
+  if ($("vectorizeMemory")?.checked && $("vectorBackend")?.value === "online" &&
+      !confirm("在线向量化会逐章发送全部原文片段和章节记忆，可能产生费用。继续吗？")) return;
   await saveSettings();
   const data = await api("/api/build_memory", {method: "POST", body: JSON.stringify({
     archive_id: currentArchiveId,
     force,
     economy_mode: $("economyMode")?.checked !== false,
-    rebuild_overview: $("rebuildOverview")?.checked === true
+    rebuild_overview: $("rebuildOverview")?.checked === true,
+    vectorize: $("vectorizeMemory")?.checked === true,
+    vector_backend: $("vectorBackend")?.value || "builtin",
+    vector_model: $("vectorModel")?.value || "",
+    vector_base_url: $("vectorBaseUrl")?.value || "",
+    vector_api_key: $("vectorApiKey")?.value || "",
+    vector_online_source: $("vectorOnlineSource")?.value || "custom"
   })});
   renderJob(data.job);
   watchJob(data.job.id);
@@ -7264,19 +8158,37 @@ async function regenerateMessageAt(messageId, editedContent = undefined) {
     if (row) row.classList.remove("is-busy");
   }
 }
+let pendingChatImage = null;
+function clearChatImage(){pendingChatImage=null;$("chatImagePreview").hidden=true;$("chatImagePreview").replaceChildren();}
+function selectChatImage(){
+  const input=document.createElement('input');input.type='file';input.accept='image/jpeg,image/png,image/webp,image/gif';
+  input.onchange=async()=>{const file=input.files?.[0];if(!file)return;
+    if(!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type))return toast('仅支持 JPEG、PNG、WebP、GIF 图片');
+    if(file.size>6000000)return toast('图片不能超过 6 MB');
+    const reader=new FileReader();reader.onload=()=>{pendingChatImage={name:file.name,url:String(reader.result)};
+      const box=$("chatImagePreview");box.replaceChildren();const img=document.createElement('img');img.src=pendingChatImage.url;img.alt='待发送图片预览';
+      const label=document.createElement('span');label.textContent=file.name;const remove=document.createElement('button');remove.className='secondary';remove.textContent='移除';remove.onclick=clearChatImage;
+      box.append(img,label,remove);box.hidden=false;};reader.readAsDataURL(file);
+  };input.click();
+}
+function initChatComposerResize(){const handle=$("chatComposerResize"),field=$("question");if(!handle||handle.dataset.ready)return;handle.dataset.ready='1';
+  let startY=0,startHeight=0;handle.addEventListener('pointerdown',event=>{startY=event.clientY;startHeight=field.getBoundingClientRect().height;handle.setPointerCapture(event.pointerId);event.preventDefault()});
+  handle.addEventListener('pointermove',event=>{if(!handle.hasPointerCapture(event.pointerId))return;const height=Math.max(60,Math.min(window.innerHeight*.46,startHeight+startY-event.clientY));field.style.height=height+'px';localStorage.setItem('chat-input-height',String(Math.round(height)))});
+}
+initChatComposerResize();const savedChatInputHeight=Number(localStorage.getItem('chat-input-height')||92);if(Number.isFinite(savedChatInputHeight))$("question").style.height=Math.max(60,Math.min(500,savedChatInputHeight))+'px';
 async function ask() {
   if (!currentArchiveId) return toast("先选择一个知识库");
   if (chatMode === "roleplay" && !activeRoleplayProfileId) return toast("请先保存或选择角色卡");
   if (!activeConversationSessionId()) await loadConversationSessions();
-  const question = $("question").value.trim();
-  if (!question) return toast("先输入问题");
-  $("question").value = "";
-  addBubble("user", question);
+  const image = pendingChatImage;
+  const question = $("question").value.trim() || (image ? "请结合这张图片回答。" : "");
+  if (!question) return toast("先输入问题或选择图片");
+  addBubble("user", question + (image ? '\n[图片：'+image.name+']' : ''));
   const pending = addBubble("assistant", chatMode === "roleplay" ? "正在回忆原著情节并进入角色……" : "正在检索知识库并调用模型……");
   $("askBtn").disabled = true;
   try {
     if (chatMode === "roleplay") {
-      const data = await api("/api/roleplay/chat", {method:"POST", body:JSON.stringify({archive_id:currentArchiveId, profile_id:activeRoleplayProfileId, session_id:activeRoleplaySessionId, message:question})});
+      const data = await api("/api/roleplay/chat", {method:"POST", body:JSON.stringify({archive_id:currentArchiveId, profile_id:activeRoleplayProfileId, session_id:activeRoleplaySessionId, message:question, image_url:image?.url||''})});
       pending.innerHTML = renderRoleplayAnswer(data.answer, data.contexts || [], data.plot_progress || {}, data.repetition || {});
       activeRoleplaySessionId = data.session?.id || activeRoleplaySessionId;
       fillRoleplayProfile(data.profile); await loadRoleplayProfiles();
@@ -7286,11 +8198,12 @@ async function ask() {
         $("roleplayStatus").textContent = progress.advanced ? `本轮沿原著推进 ${fmt(progress.advanced)} 章，当前到第 ${fmt(progress.current)} 章《${progress.title || ""}》。` : `本轮保持在第 ${fmt(progress.current)} 章《${progress.title || ""}》。`;
       }
     } else {
-      const data = await api("/api/chat", {method: "POST", body: JSON.stringify({archive_id: currentArchiveId, session_id:activeQaSessionId, question})});
+      const data = await api("/api/chat", {method: "POST", body: JSON.stringify({archive_id: currentArchiveId, session_id:activeQaSessionId, question, image_url:image?.url||''})});
       activeQaSessionId = data.session?.id || activeQaSessionId;
       pending.innerHTML = renderAnswer(data.answer, data.contexts || []);
     }
     await refreshConversationSessionPicker();
+    $("question").value = "";if(image===pendingChatImage)clearChatImage();
   } catch (err) {
     pending.textContent = "出错了：" + err.message;
   } finally {
@@ -7795,6 +8708,12 @@ async function startChapterMemoryJob(payload, confirmText) {
       archive_id: currentArchiveId,
       economy_mode: $("economyMode")?.checked !== false,
       rebuild_overview: $("rebuildOverview")?.checked === true,
+      vectorize: $("vectorizeMemory")?.checked === true,
+      vector_backend: $("vectorBackend")?.value || "builtin",
+      vector_model: $("vectorModel")?.value || "",
+      vector_base_url: $("vectorBaseUrl")?.value || "",
+      vector_api_key: $("vectorApiKey")?.value || "",
+      vector_online_source: $("vectorOnlineSource")?.value || "custom",
       ...payload
     })
   });
@@ -8754,27 +9673,26 @@ ensureSceneWorkspace();
 UI_HTML = UI_HTML.replace("</style>", SCENE_WORKSPACE_CSS + "\n  </style>")
 
 UI_REDESIGN_CSS = r"""
-    :root { --blur-nav: 10px; --blur-chat: 6px; --blur-panel: 8px; --blur-input: 4px; }
-    body.has-app-background .topbar {
-      background: color-mix(in srgb, var(--surface) 84%, transparent);
-      -webkit-backdrop-filter: blur(var(--blur-nav)); backdrop-filter: blur(var(--blur-nav));
+    :root {
+      --blur-nav: 10px; --blur-chat: 6px; --blur-panel: 8px; --blur-input: 4px;
+      --alpha-nav: 84%; --alpha-chat: 72%; --alpha-panel: 78%; --alpha-input: 76%;
     }
-    body.has-app-background .chat-panel {
-      background: color-mix(in srgb, var(--panel) 72%, transparent) !important;
-      -webkit-backdrop-filter: blur(var(--blur-chat)); backdrop-filter: blur(var(--blur-chat));
+    body.has-app-background .topbar {
+      background: color-mix(in srgb, var(--surface) var(--alpha-nav), transparent);
+      -webkit-backdrop-filter: blur(var(--blur-nav)); backdrop-filter: blur(var(--blur-nav));
     }
     body.has-app-background .card,
     body.has-app-background .chat-settings-drawer {
-      background: color-mix(in srgb, var(--panel) 78%, transparent);
+      background: color-mix(in srgb, var(--panel) var(--alpha-panel), transparent);
       -webkit-backdrop-filter: blur(var(--blur-panel)); backdrop-filter: blur(var(--blur-panel));
     }
     body.has-app-background .chat-panel {
-      background: color-mix(in srgb, var(--panel) 72%, transparent) !important;
+      background: color-mix(in srgb, var(--panel) var(--alpha-chat), transparent) !important;
       -webkit-backdrop-filter: blur(var(--blur-chat)); backdrop-filter: blur(var(--blur-chat));
     }
     body.has-app-background .composer,
     body.has-app-background .chat-titlebar {
-      background: color-mix(in srgb, var(--surface) 76%, transparent);
+      background: color-mix(in srgb, var(--surface) var(--alpha-input), transparent);
       -webkit-backdrop-filter: blur(var(--blur-input)); backdrop-filter: blur(var(--blur-input));
     }
     /* Left navigation is a drawer: collapsed by default, slides out from the left edge. */
@@ -8830,10 +9748,18 @@ UI_REDESIGN_CSS = r"""
     }
     #chatView .chat-log { padding: 22px; }
     #chatView .composer {
-      display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+      display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 9px; margin: 0; padding: 13px 17px; border-top: 1px solid var(--line);
       background: var(--surface); border-radius: 0 0 20px 20px;
     }
+    #chatView .composer-resize { grid-column:1/-1; height:8px; margin:-13px -17px 3px; cursor:ns-resize; touch-action:none; }
+    #chatView .composer-resize:hover, #chatView .composer-resize:focus-visible { background:var(--accent-soft); }
+    #chatView .composer-input { min-width:0; }
+    #chatView .composer-input textarea { width:100%; height:var(--chat-input-height,92px); min-height:60px; max-height:46vh; resize:none; }
+    #chatView .chat-image-preview { display:flex; align-items:center; gap:8px; padding:5px 7px; margin-bottom:6px; border:1px solid var(--line); border-radius:9px; }
+    #chatView .chat-image-preview[hidden] { display:none; }
+    #chatView .chat-image-preview img { width:48px; height:48px; object-fit:cover; border-radius:6px; }
+    #chatView .chat-image-preview button { margin-left:auto; min-height:28px; padding:3px 8px; }
     .chat-round-btn {
       width: 46px; height: 46px; min-height: 46px; padding: 0; border-radius: 50%;
       font-size: 20px; line-height: 1;
@@ -8890,9 +9816,14 @@ UI_REDESIGN_JS = r"""
   const APP_BACKGROUND_KEY = "pardo.appBackground.v1";
   const NAV_HOVER_KEY = "pardo.navHover.v1";
   const BACKGROUND_BLUR_KEY = "pardo.backgroundBlur.v1";
+  const BACKGROUND_ALPHA_KEY = "pardo.backgroundAlpha.v1";
   const BLUR_DEFAULTS = { nav: 10, chat: 6, panel: 8, input: 4 };
+  const ALPHA_DEFAULTS = { nav: 84, chat: 72, panel: 78, input: 76 };
   const BLUR_FIELDS = { nav: "blurNav", chat: "blurChat", panel: "blurPanel", input: "blurInput" };
+  const ALPHA_FIELDS = { nav: "alphaNav", chat: "alphaChat", panel: "alphaPanel", input: "alphaInput" };
   let backgroundBlur = { ...BLUR_DEFAULTS };
+  let backgroundAlpha = { ...ALPHA_DEFAULTS };
+  let appearanceSaveTimer = 0;
   const navBackdrop = document.getElementById("navBackdrop");
   let navDrawerEnabled = true;
   let navCloseTimer = 0;
@@ -8963,6 +9894,37 @@ UI_REDESIGN_JS = r"""
     }
   }
 
+  function applyBackgroundAlpha(values) {
+    for (const [region, variable] of Object.entries({nav: "--alpha-nav", chat: "--alpha-chat", panel: "--alpha-panel", input: "--alpha-input"})) {
+      const value = Math.max(20, Math.min(100, Number(values[region] ?? ALPHA_DEFAULTS[region])));
+      backgroundAlpha[region] = value;
+      document.documentElement.style.setProperty(variable, value + "%");
+      const input = document.getElementById(ALPHA_FIELDS[region]);
+      if (input) input.value = String(value);
+      const output = document.getElementById(ALPHA_FIELDS[region] + "Value");
+      if (output) output.textContent = value + "%";
+    }
+  }
+
+  function loadBackgroundAlpha() {
+    try {
+      const raw = localStorage.getItem(BACKGROUND_ALPHA_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") backgroundAlpha = { ...ALPHA_DEFAULTS, ...parsed };
+      }
+    } catch (err) { /* keep defaults */ }
+    applyBackgroundAlpha(backgroundAlpha);
+  }
+
+  function setBackgroundAlpha(region, value) {
+    if (!(region in ALPHA_DEFAULTS)) return;
+    backgroundAlpha = { ...backgroundAlpha, [region]: Math.max(20, Math.min(100, Number(value) || 20)) };
+    applyBackgroundAlpha(backgroundAlpha);
+    try { localStorage.setItem(BACKGROUND_ALPHA_KEY, JSON.stringify(backgroundAlpha)); } catch (err) { /* ignore */ }
+    scheduleAppearanceSave();
+  }
+
   function applyBackgroundBlur(values) {
     for (const [region, variable] of Object.entries({nav: "--blur-nav", chat: "--blur-chat", panel: "--blur-panel", input: "--blur-input"})) {
       const value = Math.max(0, Math.min(24, Number(values[region] ?? BLUR_DEFAULTS[region])));
@@ -8991,6 +9953,33 @@ UI_REDESIGN_JS = r"""
     backgroundBlur = { ...backgroundBlur, [region]: Math.max(0, Math.min(24, Number(value) || 0)) };
     applyBackgroundBlur(backgroundBlur);
     try { localStorage.setItem(BACKGROUND_BLUR_KEY, JSON.stringify(backgroundBlur)); } catch (err) { /* ignore */ }
+    scheduleAppearanceSave();
+  }
+
+  function scheduleAppearanceSave() {
+    clearTimeout(appearanceSaveTimer);
+    appearanceSaveTimer = setTimeout(async () => {
+      try {
+        const response = await fetch('/api/ui/appearance', {method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({alpha:backgroundAlpha, blur:backgroundBlur})});
+        if (!response.ok) throw new Error('无法保存界面外观');
+      } catch (err) { toast('透明度与虚化设置未能保存：' + err.message); }
+    }, 300);
+  }
+
+  async function loadUiAppearance() {
+    loadBackgroundAlpha();
+    loadBackgroundBlur();
+    try {
+      const response = await fetch('/api/ui/appearance', {cache:'no-store'});
+      if (!response.ok) throw new Error('无法读取界面外观');
+      const saved = await response.json();
+      if (saved.alpha && Object.keys(saved.alpha).length) backgroundAlpha = {...ALPHA_DEFAULTS, ...saved.alpha};
+      if (saved.blur && Object.keys(saved.blur).length) backgroundBlur = {...BLUR_DEFAULTS, ...saved.blur};
+      applyBackgroundAlpha(backgroundAlpha);
+      applyBackgroundBlur(backgroundBlur);
+      if (!Object.keys(saved).length) scheduleAppearanceSave();
+    } catch (err) { toast('界面外观读取失败：' + err.message); }
   }
 
   function applyAppBackground(dataUrl) {
@@ -9016,12 +10005,36 @@ UI_REDESIGN_JS = r"""
     if (status) status.textContent = text;
   }
 
-  function loadAppBackground() {
+  async function persistAppBackground(image) {
+    const response = await fetch("/api/ui/background", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({image})
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || "无法保存背景图片");
+  }
+
+  async function loadAppBackground() {
     try {
-      const saved = localStorage.getItem(APP_BACKGROUND_KEY);
+      const response = await fetch("/api/ui/background", {cache: "no-store"});
+      if (!response.ok) throw new Error("无法读取本地背景文件");
+      const result = await response.json();
+      let saved = result.image || "";
+      if (!saved) {
+        // Migrate images saved by older versions under the current WebView origin.
+        const legacy = localStorage.getItem(APP_BACKGROUND_KEY);
+        if (legacy) {
+          await persistAppBackground(legacy);
+          saved = legacy;
+          localStorage.removeItem(APP_BACKGROUND_KEY);
+        }
+      }
       if (saved) {
         applyAppBackground(saved);
-        updateBackgroundStatus("当前使用自定义背景（仅保存在本机）。");
+        updateBackgroundStatus("当前使用自定义背景（已保存到本地数据目录）。");
+      } else {
+        applyAppBackground("");
+        updateBackgroundStatus("当前使用默认背景。");
       }
     } catch (err) {
       updateBackgroundStatus("背景读取失败：" + err.message);
@@ -9034,7 +10047,7 @@ UI_REDESIGN_JS = r"""
     updateBackgroundStatus("正在处理背景图片…");
     const objectUrl = URL.createObjectURL(file);
     const image = new Image();
-    image.onload = () => {
+    image.onload = async () => {
       try {
         const maxWidth = 1920;
         const scale = Math.min(1, maxWidth / image.width);
@@ -9046,13 +10059,10 @@ UI_REDESIGN_JS = r"""
         context.fillRect(0, 0, canvas.width, canvas.height);
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
-        try {
-          localStorage.setItem(APP_BACKGROUND_KEY, dataUrl);
-        } catch (storageError) {
-          throw new Error("图片压缩后仍超过本机存储限制，请换一张更小的图片");
-        }
+        await persistAppBackground(dataUrl);
+        try { localStorage.removeItem(APP_BACKGROUND_KEY); } catch (err) { /* legacy storage */ }
         applyAppBackground(dataUrl);
-        updateBackgroundStatus("已应用自定义背景（仅保存在本机）。");
+        updateBackgroundStatus("已应用自定义背景（已保存到本地数据目录）。");
         toast("背景已更新");
       } catch (err) {
         updateBackgroundStatus("背景设置失败：" + err.message);
@@ -9069,11 +10079,17 @@ UI_REDESIGN_JS = r"""
     image.src = objectUrl;
   }
 
-  function clearAppBackground() {
-    try { localStorage.removeItem(APP_BACKGROUND_KEY); } catch (err) { /* ignore */ }
-    applyAppBackground("");
-    updateBackgroundStatus("当前使用默认背景。");
-    toast("已恢复默认背景");
+  async function clearAppBackground() {
+    try {
+      await persistAppBackground("");
+      try { localStorage.removeItem(APP_BACKGROUND_KEY); } catch (err) { /* legacy storage */ }
+      applyAppBackground("");
+      updateBackgroundStatus("当前使用默认背景。");
+      toast("已恢复默认背景");
+    } catch (err) {
+      updateBackgroundStatus("背景清除失败：" + err.message);
+      toast("背景清除失败：" + err.message);
+    }
   }
 
   window.toggleNavDrawer = toggleNavDrawer;
@@ -9084,6 +10100,7 @@ UI_REDESIGN_JS = r"""
   window.clearAppBackground = clearAppBackground;
   window.loadAppBackground = loadAppBackground;
   window.setBackgroundBlur = setBackgroundBlur;
+  window.setBackgroundAlpha = setBackgroundAlpha;
 
   const topbar = document.querySelector(".topbar");
   document.addEventListener("mousemove", (event) => {
@@ -9119,7 +10136,7 @@ UI_REDESIGN_JS = r"""
     closeChatArchiveMenu();
   });
 
-  loadBackgroundBlur();
+  loadUiAppearance();
   loadAppBackground();
 })();
 """
@@ -9319,9 +10336,19 @@ $('readerSettingsOverlay').querySelector('.reader-settings-grid').insertAdjacent
 const deskPrefs=JSON.parse(localStorage.getItem('reader-prefs')||'{}');$('readerSize').value=deskPrefs.size||20;$('readerBg').value=deskPrefs.bg||'#f6f0e5';$('readerFg').value=deskPrefs.fg||'#302b27';$('readerFont').value=deskPrefs.font||'system';$('readerBrightness').value=deskPrefs.brightness||100;$('readerPageMargin').value=deskPrefs.margin||28;$('readerLineSpacing').value=Math.round((deskPrefs.leading||1.8)*100);$('readerLetterSpacing').value=deskPrefs.spacing||0;$('readerAlign').value=deskPrefs.align==='justify'?'justify':'left';readerMode=deskPrefs.mode==='horizontal'?'horizontal':'scroll';$('readerMode').value=readerMode;$('readerPages').dataset.mode=readerMode;readerStyle();
 $('readerGroups').addEventListener('toggle',e=>{const d=e.target;if(d.tagName!=='DETAILS'||!d.open)return;const start=Number(d.dataset.start),list=d.querySelector('.reader-group-list');if(list.dataset.ready)return;list.innerHTML=readerRows.slice(start,start+100).map((c,i)=>`<button class="${start+i===readerIndex?'active':''}" onclick="deskChooseChapter(${start+i})">${start+i+1}. ${escapeHtml(c.title)}</button>`).join('');list.dataset.ready='1'},true);
 $('readerText').addEventListener('scroll',()=>{if(readerMode!=='scroll')return;deskExtend();const box=$('readerText'),at=box.getBoundingClientRect().top+box.clientHeight*.35;for(const section of box.querySelectorAll('.reader-chapter')){if(section.getBoundingClientRect().top<=at)readerIndex=Number(section.dataset.index);else break}deskPersist();$('readerProgress').textContent=readerRows[readerIndex]?.title||''},{passive:true});
+let deskEpubImages=[],deskEpubImageIndex=0;
+$('readerLayout').querySelector('.reader-toolbar strong').insertAdjacentHTML('afterend','<button onclick="deskOpenImages()">插图</button>');
+deskView.insertAdjacentHTML('beforeend','<div id="deskEpubGallery" class="reader-overlay" onclick="if(event.target===this)deskCloseImages()"><aside class="reader-panel" style="width:min(90vw,920px)"><div class="reader-panel-head"><strong>EPUB 插图</strong><button onclick="deskCloseImages()">关闭</button></div><div class="reader-panel-body" style="display:flex;flex-direction:column;align-items:center;gap:12px"><img id="deskEpubImage" alt="EPUB 插图" style="max-width:100%;max-height:70vh;object-fit:contain"><div id="deskEpubImageCaption" class="meta"></div><div class="row"><button onclick="deskShowImage(deskEpubImageIndex-1)">上一张</button><button onclick="deskShowImage(deskEpubImageIndex+1)">下一张</button></div></div></aside></div>');
+async function deskOpenImages(){if(!deskArchive)return;const data=await api('/api/epub_images/'+deskArchive);deskEpubImages=data.images||[];if(!deskEpubImages.length)return toast('当前知识库没有已保存的 EPUB 插图；旧存档需重新导入原 EPUB。');$('deskEpubGallery').classList.add('open');deskShowImage(0)}
+function deskCloseImages(){$('deskEpubGallery').classList.remove('open');$('deskEpubImage').removeAttribute('src')}
+async function deskShowImage(index){if(index<0||index>=deskEpubImages.length)return;deskEpubImageIndex=index;const item=deskEpubImages[index];$('deskEpubImageCaption').textContent=`${index+1}/${deskEpubImages.length} · ${item.filename}`;const data=await api('/api/epub_image/'+item.id);if(deskEpubImageIndex===index)$('deskEpubImage').src=data.data_url}
 """
 UI_HTML=UI_HTML.replace("</style>",READER_CSS+"\n</style>")
 UI_HTML=UI_HTML.replace("</body>","<script>\n"+READER_JS+"\n</script>\n</body>")
+UI_HTML=UI_HTML.replace("</style>",generation_desktop_ui.CSS+"\n</style>")
+UI_HTML=UI_HTML.replace("</body>","<script>\n"+generation_desktop_ui.JS+"\n</script>\n</body>")
+UI_HTML=UI_HTML.replace("</style>",transfer_desktop_ui.CSS+"\n</style>")
+UI_HTML=UI_HTML.replace("</body>","<script>\n"+transfer_desktop_ui.JS+"\n</script>\n</body>")
 
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):

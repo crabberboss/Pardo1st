@@ -45,10 +45,15 @@ public class ChatEngineTest {
                     .put("timeline_start_cutoff",1).put("plot_mode","跟随原著推进").put("plot_step",1)).getLong("id");
             long session=data.createSession(archive,"roleplay",profile,"第一条线").getLong("id");
             ChatEngine engine=new ChatEngine(context,store,data,api);
-            JSONObject result=engine.respond(archive,"roleplay",profile,session,"你看见什么？",0);
+            String image="data:image/png;base64,iVBORw0KGgo=";
+            JSONObject result=engine.respond(archive,"roleplay",profile,session,"你看见什么？",0,image);
             assertEquals(2,result.getJSONObject("session").getInt("cutoff"));
             assertEquals("甲看向门口。",result.getJSONArray("messages").getJSONObject(1).getString("content"));
             assertTrue(request.get().contains("第二章 相遇"));
+            JSONObject sent=new JSONObject(request.get());
+            org.json.JSONArray parts=sent.getJSONArray("messages").getJSONObject(sent.getJSONArray("messages").length()-1).getJSONArray("content");
+            assertEquals("image_url",parts.getJSONObject(1).getString("type"));
+            assertEquals(image,parts.getJSONObject(1).getJSONObject("image_url").getString("url"));
             assertFalse(request.get().contains("乙其实来自未来"));
         }finally{server.close();responder.join(5000);store.close();}
     }

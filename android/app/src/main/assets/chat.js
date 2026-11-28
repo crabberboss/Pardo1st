@@ -1,4 +1,4 @@
-let chatMode='qa',chatProfileId=0,chatSessionId=0,chatBusy=false,chatState=null,chatEditMessageId=0,chatEditAnswerId=0,chatDraft='';
+let chatMode='qa',chatProfileId=0,chatSessionId=0,chatBusy=false,chatState=null,chatEditMessageId=0,chatEditAnswerId=0,chatDraft='',chatImage=null;
 $('presetTokens').parentElement.insertAdjacentHTML('afterend','<label>采样温度（0–2）</label><input id="presetTemperature" type="number" min="0" max="2" step="0.05" value="0.6">');
 $('chatGlobalPrompt').insertAdjacentHTML('beforebegin','<label><input id="chatWebSearchEnabled" type="checkbox"> 联网搜索（默认关闭）</label><p class="muted">DeepSeek 渠道自动使用 DeepSeek 官方搜索接口和已保存的 DeepSeek Key；其他渠道使用 Brave 搜索。</p><label>Brave Search API Key（仅供其他渠道使用）</label><input id="chatWebSearchKey" type="password" placeholder="填写搜索服务密钥；留空保持不变">');
 $('chatRolePanel').querySelector('.row').insertAdjacentHTML('afterend','<div class="row wrap topspace"><button class="secondary" onclick="importRoleCard()">导入角色卡 JSON/PNG</button><button class="secondary" onclick="exportRoleCard()">导出当前角色卡</button></div>');
@@ -11,7 +11,10 @@ function changeChatMode(){chatMode=$('chatModeSelect').value;chatProfileId=chatM
 function changeChatProfile(){chatProfileId=Number($('chatProfileSelect').value)||0;chatSessionId=0;openChat();}
 function changeChatSession(){chatSessionId=Number($('chatSessionSelect').value)||0;toggleChatSessions(false);openChat();}
 function chatBusySet(value){chatBusy=value;$('sendBtn').disabled=value;$('chatThinking').classList.toggle('hidden',!value);}
-function sendChat(){if(!needArchive()||chatBusy)return;if(chatMode==='roleplay'&&!chatProfileId)return notice('请先在功能中创建或选择角色卡');const text=$('question').value.trim();if(!text)return;chatDraft=text;chatBusySet(true);chatRequest('chatSend',{text});$('question').value='';}
+function clearChatImage(){chatImage=null;$('chatImageInput').value='';$('chatImagePreview').replaceChildren();$('chatImagePreview').classList.add('hidden')}
+function chatImageSelected(input){const file=input.files?.[0];if(!file)return;if(!['image/jpeg','image/png','image/webp','image/gif'].includes(file.type)||file.size>4000000){clearChatImage();return notice('请选择不超过 4 MB 的 JPEG、PNG、WebP 或 GIF 图片')}
+ const reader=new FileReader();reader.onload=()=>{chatImage={name:file.name,url:String(reader.result)};const box=$('chatImagePreview');box.replaceChildren();const img=document.createElement('img');img.src=chatImage.url;img.alt='待发送图片';const label=document.createElement('span');label.textContent=file.name;const remove=document.createElement('button');remove.className='secondary';remove.textContent='移除';remove.onclick=clearChatImage;box.append(img,label,remove);box.classList.remove('hidden')};reader.onerror=()=>{clearChatImage();notice('读取图片失败')};reader.readAsDataURL(file)}
+function sendChat(){if(!needArchive()||chatBusy)return;if(chatMode==='roleplay'&&!chatProfileId)return notice('请先在功能中创建或选择角色卡');const text=$('question').value.trim()||(chatImage?'请结合这张图片回答。':'');if(!text)return notice('先输入消息或选择图片');chatDraft=text;chatBusySet(true);chatRequest('chatSend',{text,image_url:chatImage?.url||''});$('question').value='';}
 function chatOptions(items,current,label){return items.map(item=>`<option value="${item.id}" ${Number(item.id)===Number(current)?'selected':''}>${esc(item.name||label)}</option>`).join('');}
 function renderChatSelectors(){
  $('chatArchiveSelect').innerHTML=chatOptions(archives,archiveId,'知识库');$('chatModeSelect').value=chatMode;
@@ -28,7 +31,7 @@ function renderChat(){const state=chatState;if(!state)return;
 }
 function windowChatEvent(type,data){if(type==='chatGlobals'){fillChatGlobals(data);return;}
  if(type!=='chatState'||data.archive_id!==archiveId)return;
- chatMode=data.mode;chatProfileId=data.profile_id||0;chatSessionId=data.session?.id||0;chatState=data;chatBusySet(false);chatDraft='';renderChat();}
+ const sent=chatBusy;chatMode=data.mode;chatProfileId=data.profile_id||0;chatSessionId=data.session?.id||0;chatState=data;chatBusySet(false);chatDraft='';if(sent)clearChatImage();renderChat();}
 window.chatEvent=windowChatEvent;
 window.chatError=message=>{if(chatBusy){chatBusySet(false);if(chatDraft&&!$('question').value)$('question').value=chatDraft;chatDraft='';}};
 function createChatSession(){if(chatBusy)return;const name=$('chatSessionName').value.trim()||'新对话';if(chatMode==='roleplay'&&!chatProfileId)return notice('请先选角色卡');chatRequest('chatCreateSession',{name});$('chatSessionName').value='';}

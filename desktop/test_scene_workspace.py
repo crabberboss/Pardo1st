@@ -147,7 +147,7 @@ class SceneWorkspaceTests(unittest.TestCase):
         self.assertIn('雪山', indexed)
         self.assertNotIn('密室', indexed)
         package = app.export_archive(self.a)
-        self.assertEqual(package['version'], 4)
+        self.assertEqual(package['version'], 5)
         imported = app.import_archive_package(package)
         self.assertTrue(app.list_chapters(imported)[0]['source_edited'])
         self.assertEqual(app.chapter_source(imported, app.list_chapters(imported)[0]['document_id'], '第一章')['text'], edited)
@@ -583,36 +583,15 @@ class SceneWorkspaceTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    def test_retired_generation_surface_is_removed(self):
+    def test_generation_workspace_is_independent_from_legacy_generation_engine(self):
         self.assertFalse(hasattr(app, 'generation_store'))
         self.assertFalse(hasattr(app, 'generation_writer'))
         self.assertFalse(hasattr(app, 'GENERATION_THREADS'))
-        self.assertNotIn('generationView', app.UI_HTML)
-        self.assertNotIn('navGeneration', app.UI_HTML)
-        self.assertNotIn('/api/generation', app.UI_HTML)
-        server = ThreadingHTTPServer(('127.0.0.1', 0), app.Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f'http://127.0.0.1:{server.server_port}'
-        try:
-            cases = [
-                ('GET', '/api/generation/projects', None),
-                ('GET', '/api/generation/project/legacy', None),
-                ('POST', '/api/generation/create', {'title': '旧工程'}),
-                ('POST', '/api/generation/start', {'id': 'legacy'}),
-            ]
-            for method, route, payload in cases:
-                data = json.dumps(payload).encode('utf-8') if payload is not None else None
-                request = urllib.request.Request(base + route, data=data,
-                                                 headers={'Content-Type': 'application/json'},
-                                                 method=method)
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    urllib.request.urlopen(request, timeout=5)
-                self.assertEqual(caught.exception.code, 404)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
+        self.assertIn('generationView', app.UI_HTML)
+        self.assertIn('navGeneration', app.UI_HTML)
+        self.assertIn('/api/generation/save_chapter', app.UI_HTML)
+        self.assertIn('/api/generation/create', app.UI_HTML)
+        self.assertIn('/api/generation/start', app.UI_HTML)
 
     def test_basic_rewrite_http_flow_without_project_id(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), app.Handler)

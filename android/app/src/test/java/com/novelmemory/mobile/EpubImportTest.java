@@ -23,9 +23,11 @@ public class EpubImportTest {
             entry(zip,"OPS/book.opf","<package><manifest><item id='b' href='b.xhtml'/><item id='a' href='a.xhtml'/></manifest><spine><itemref idref='a'/><itemref idref='b'/></spine></package>");
             entry(zip,"OPS/a.xhtml","<html><body><p>开端。</p></body></html>");
             entry(zip,"OPS/b.xhtml","<html><body><p>结尾。</p></body></html>");
+            entry(zip,"OPS/pic.png","image-bytes");
         }
         String text=EpubImport.extract(new ByteArrayInputStream(bytes.toByteArray()));
         assertTrue(text.indexOf("开端")<text.indexOf("结尾"));
         assertTrue(text.contains("第2章"));
+        assertEquals(1,EpubImport.extractImages(new ByteArrayInputStream(bytes.toByteArray())).size());
     }
 }

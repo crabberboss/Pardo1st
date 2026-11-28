@@ -26,6 +26,15 @@ public class MainActivityTest {
         String paragraph="角色走过长廊，发现一扇锁住的门。".repeat(10);
         assertTrue(MainActivity.hasLongRepeatedParagraph(paragraph+"\n\n"+paragraph));
     }
+    @Test public void readerAndNavigationQueriesDoNotRestartForegroundService() throws Exception {
+        Method kind=MainActivity.class.getDeclaredMethod("isLightweightRequest",String.class);
+        kind.setAccessible(true);
+        assertEquals(true,kind.invoke(null,"readerSlice"));
+        assertEquals(true,kind.invoke(null,"readerPrefetch"));
+        assertEquals(true,kind.invoke(null,"transferOptions"));
+        assertEquals(false,kind.invoke(null,"generationStart"));
+        assertEquals(false,kind.invoke(null,"chatSend"));
+    }
     @Test public void javascriptConfirmHasNativeDialogHandler() {
         MainActivity activity=Robolectric.buildActivity(MainActivity.class).setup().get();
         ViewGroup root=activity.findViewById(android.R.id.content);
@@ -50,5 +59,27 @@ public class MainActivityTest {
             assertTrue(expected.getCause() instanceof IllegalArgumentException);
         }
         assertEquals(24576,activity.getPreferences(Context.MODE_PRIVATE).getInt("rewrite_max_tokens",0));
+    }
+    @Test public void generationExpansionPromptsPersistInSettings() throws Exception {
+        MainActivity activity=Robolectric.buildActivity(MainActivity.class).setup().get();
+        Method handle=MainActivity.class.getDeclaredMethod("handle",String.class,JSONObject.class);
+        handle.setAccessible(true);
+        JSONObject prompts=new JSONObject(),limits=new JSONObject();
+        for(String key:new String[]{"outline","world","system","protagonist","style","chapter"}){
+            prompts.put(key,key+" 扩写要求");limits.put(key,4096);
+        }
+        limits.put("world",12000);
+        handle.invoke(activity,"generationExpandSettingsSave",new JSONObject().put("prompts",prompts).put("limits",limits));
+        JSONObject saved=new JSONObject(activity.getPreferences(Context.MODE_PRIVATE).getString("generation_expand_prompts","{}"));
+        assertEquals("chapter 扩写要求",saved.getString("chapter"));
+        JSONObject savedLimits=new JSONObject(activity.getPreferences(Context.MODE_PRIVATE).getString("generation_expand_limits","{}"));
+        assertEquals(12000,savedLimits.getInt("world"));
+        limits.put("world",40000);
+        try{
+            handle.invoke(activity,"generationExpandSettingsSave",new JSONObject().put("prompts",prompts).put("limits",limits));
+            throw new AssertionError("超出输出上限应被拒绝");
+        }catch(java.lang.reflect.InvocationTargetException expected){assertTrue(expected.getCause() instanceof IllegalArgumentException);}
+        JSONObject stillSaved=new JSONObject(activity.getPreferences(Context.MODE_PRIVATE).getString("generation_expand_limits","{}"));
+        assertEquals(12000,stillSaved.getInt("world"));
     }
 }

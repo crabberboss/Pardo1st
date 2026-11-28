@@ -1,10 +1,22 @@
 import io
 import unittest
 import zipfile
-from epub_import import extract_epub
+from epub_import import extract_epub, extract_epub_images
 
 
 class EpubImportTests(unittest.TestCase):
+    def test_extracts_manifest_images_without_inlining_them_in_text(self):
+        target = io.BytesIO()
+        with zipfile.ZipFile(target, 'w') as book:
+            book.writestr('META-INF/container.xml', '<container><rootfile full-path="OPS/book.opf"/></container>')
+            book.writestr('OPS/book.opf', '<package><manifest><item id="c" href="c.xhtml"/><item id="i" href="pic.png" media-type="image/png"/></manifest><spine><itemref idref="c"/></spine></package>')
+            book.writestr('OPS/c.xhtml', '<html><body><p>文字</p><img src="pic.png"/></body></html>')
+            book.writestr('OPS/pic.png', b'png-test')
+        images = extract_epub_images(target.getvalue())
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]['content'], b'png-test')
+        self.assertNotIn('png-test', extract_epub(target.getvalue()))
+
     def test_spine_order_and_script_removal(self):
         target = io.BytesIO()
         with zipfile.ZipFile(target, 'w') as book:

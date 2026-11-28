@@ -32,11 +32,16 @@ assert.equal(element('chapterPrompt').previousElementSibling.textContent,'本章
 assert(context.window.nativeEvent);
 assert(element('chatMenu').classList);
 assert(html.includes('onclick="toggleChatSessions(true)" aria-label="选择对话存档"'));
+assert(html.includes('id="chatImageInput"'));
 assert(!html.includes('id="chapterSearch"'));
 assert(html.includes('id="rewriteOriginal"'));
 const parsed=vm.runInContext('parseSummary("关键词：甲、密室\\n剧情概览：甲进入密室。\\n人物与关系：甲与乙合作。")',context);
 assert.equal(parsed.keywords,'甲、密室');assert.equal(parsed.plot,'甲进入密室。');assert.equal(parsed.characters,'甲与乙合作。');
 vm.runInContext('archives=[{id:1,name:"测试书",count:2}];archiveId=1;',context);
+vm.runInContext('chatImage={name:"test.png",url:"data:image/png;base64,iVBORw0KGgo="};chatMode="qa";chatBusy=false',context);
+element('question').value='描述图片';vm.runInContext('sendChat()',context);
+assert(calls.some(c=>c.name==='chatSend'&&c.data.image_url==='data:image/png;base64,iVBORw0KGgo='));
+vm.runInContext('chatBusy=false;chatImage=null',context);
 vm.runInContext('chapterTotal=97;chapterOffset=40;chapterRows=[{id:2,title:"第二页",chars:100,summary:"",error:""}];renderChapters()',context);
 assert.equal(element('pageText').textContent,'2/3 页');
 assert(!element('chapterList').innerHTML.includes('未改写'));

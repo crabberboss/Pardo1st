@@ -92,6 +92,34 @@ final class Api {
     synchronized String selected(){return prefs.getString("selected","deepseek");}
     synchronized void select(String provider){prefs.edit().putString("selected",validProvider(provider)).apply();}
 
+    synchronized JSONObject exportProfiles(boolean includeKeys) throws Exception {
+        JSONObject profiles=new JSONObject();
+        for(String provider:new String[]{"lmstudio","siliconflow","deepseek","openrouter","gemini","glm"}){
+            JSONObject row=config(provider);
+            JSONObject portable=new JSONObject().put("base_url",row.getString("base_url"))
+                .put("chat_model",row.getString("model"));
+            if(includeKeys){String secret=key(provider);if(!secret.isEmpty())portable.put("api_key",secret);}
+            profiles.put(provider,portable);
+        }
+        return profiles;
+    }
+
+    synchronized int importProfiles(JSONObject profiles,boolean allowKeys) throws Exception {
+        int imported=0;
+        SharedPreferences.Editor edit=prefs.edit();
+        for(String provider:new String[]{"lmstudio","siliconflow","deepseek","openrouter","gemini","glm"}){
+            JSONObject row=profiles.optJSONObject(provider);if(row==null)continue;
+            if(row.has("api_key")&&!allowKeys)throw new IllegalArgumentException("文件包含 API Key；请明确勾选允许导入密钥");
+            String base=normalizeUrl(provider,row.optString("base_url",defaultUrl(provider)));
+            if(!base.startsWith("https://")&&!base.startsWith("http://"))throw new IllegalArgumentException("API 地址必须是 http(s):// URL");
+            edit.putString(provider+".url",base).putString(provider+".model",row.optString("chat_model",row.optString("model",defaultModel(provider))).trim());
+            if(allowKeys&&!row.optString("api_key","").isEmpty())edit.putString(provider+".key",encrypt(row.getString("api_key")));
+            imported++;
+        }
+        edit.apply();
+        return imported;
+    }
+
     private static SecretKey secretKey() throws Exception {
         KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);
         if(!store.containsAlias(KEY_ALIAS)){
@@ -115,6 +143,37 @@ final class Api {
         return new String(cipher.doFinal(ciphertext),StandardCharsets.UTF_8);
     }
     private synchronized String key(String provider) throws Exception {String encoded=prefs.getString(provider+".key","");return encoded.isEmpty()?"":decrypt(encoded);}
+
+    float[][] embed(String provider,String model,JSONArray inputs) throws Exception {
+        if(!"siliconflow".equals(provider)&&!"openrouter".equals(provider))
+            throw new IllegalArgumentException("安卓在线向量化目前支持硅基流动和 OpenRouter；不能把聊天模型当成嵌入模型");
+        if(model==null||model.trim().isEmpty())throw new IllegalArgumentException("请填写独立的嵌入模型 ID");
+        if(inputs.length()<1||inputs.length()>16)throw new IllegalArgumentException("嵌入批次数量须为 1–16");
+        String token=key(provider);
+        if(token.isEmpty())throw new IllegalStateException("请先在 API 设置中保存 "+providerLabel(provider)+" 的 API Key");
+        String base=config(provider).getString("base_url");
+        if(!base.startsWith("https://"))throw new IllegalArgumentException("在线嵌入 API 必须使用 HTTPS");
+        HttpResult result=request(provider,"POST",base+"/embeddings",token,
+            new JSONObject().put("model",model.trim()).put("input",inputs),90);
+        if(result.status>=400)throw new IllegalStateException("向量接口返回 HTTP "+result.status+"（"+errorLabel(classify(result.status,result.body))+"）；请检查嵌入模型 ID、权限及余额");
+        JSONArray data=new JSONObject(result.body).getJSONArray("data");
+        float[][] vectors=new float[inputs.length()][];int dimensions=0;
+        for(int i=0;i<data.length();i++){
+            JSONObject row=data.getJSONObject(i);int index=row.optInt("index",i);
+            if(index<0||index>=vectors.length||vectors[index]!=null)throw new IllegalStateException("向量接口返回的序号无效");
+            JSONArray values=row.getJSONArray("embedding");
+            if(values.length()<1||values.length()>8192)throw new IllegalStateException("向量维度无效");
+            if(dimensions==0)dimensions=values.length();
+            if(dimensions!=values.length())throw new IllegalStateException("向量维度不一致");
+            float[] vector=new float[dimensions];double norm=0;
+            for(int j=0;j<dimensions;j++){double value=values.getDouble(j);if(!Double.isFinite(value))throw new IllegalStateException("向量包含无效数字");vector[j]=(float)value;norm+=value*value;}
+            if(norm<=0)throw new IllegalStateException("向量为空");
+            float scale=(float)(1/Math.sqrt(norm));for(int j=0;j<dimensions;j++)vector[j]*=scale;
+            vectors[index]=vector;
+        }
+        for(float[] vector:vectors)if(vector==null)throw new IllegalStateException("向量接口返回数量不足");
+        return vectors;
+    }
 
     boolean isDeepseekSelected(){return "deepseek".equals(selected());}
     String searchDeepseek(String query) throws Exception {
@@ -145,6 +204,27 @@ final class Api {
     private static final class HttpResult {
         int status;String body;String url;
         HttpResult(int status,String body,String url){this.status=status;this.body=body;this.url=url;}
+    }
+    static void requestNonThinking(JSONObject payload,String provider,String model) throws Exception {
+        String lower=model.toLowerCase(java.util.Locale.ROOT);
+        switch(provider){
+            case "deepseek":payload.put("thinking",new JSONObject().put("type","disabled"));break;
+            case "siliconflow":
+                if(!lower.contains("deepseek-r1"))payload.put("enable_thinking",false);
+                break;
+            case "openrouter":
+                if(!lower.startsWith("openrouter/")&&!lower.contains("/o1")&&!lower.contains("/o3")&&!lower.contains("/o4")
+                    &&!lower.contains("/gemini-3")&&!lower.contains("/gemini-4")&&!lower.contains("/glm-5.3")&&!lower.contains("/deepseek-r1"))
+                    payload.put("reasoning",new JSONObject().put("enabled",false));
+                break;
+            case "glm":
+                if(!lower.startsWith("glm-5.3"))payload.put("thinking",new JSONObject().put("type","disabled"));
+                break;
+            case "gemini":
+                if(lower.startsWith("gemini-2.5-flash"))payload.put("reasoning_effort","none");
+                break;
+            default:break; // LM Studio's /v1/chat/completions has no universal reasoning-off parameter.
+        }
     }
     private HttpResult request(String provider,String method,String url,String apiKey,JSONObject body,int timeoutSeconds) throws Exception {
         HttpURLConnection conn=(HttpURLConnection)new URL(url).openConnection();
@@ -289,6 +369,7 @@ final class Api {
             JSONObject payload=new JSONObject().put("model",chosen)
                     .put("messages",new JSONArray().put(new JSONObject().put("role","user").put("content","只回复：连接成功")))
                     .put("max_tokens",32).put("temperature",0).put("stream",false);
+            requestNonThinking(payload,cfg.getString("provider"),chosen);
             String chatUrl=cfg.getString("base_url")+"/chat/completions";
             HttpResult result=request(cfg.getString("provider"),"POST",chatUrl,key,payload,45);
             if(result.status>=400){
@@ -337,12 +418,17 @@ final class Api {
     }
 
     ChatResult chatDetailed(JSONArray messages,int maxTokens,int timeoutSeconds,Double temperature) throws Exception {
+        return chatDetailed(messages,maxTokens,timeoutSeconds,temperature,true);
+    }
+
+    ChatResult chatDetailed(JSONArray messages,int maxTokens,int timeoutSeconds,Double temperature,boolean nonThinking) throws Exception {
         String provider=selected();JSONObject stored=config(provider);
         JSONObject cfg=resolve(provider,stored.getString("base_url"),stored.getString("model"),"",false);
         String base=cfg.getString("base_url");
         String url=base.endsWith("/chat/completions")?base:base+"/chat/completions";
         String model=cfg.getString("model");if(model.isEmpty())throw new IllegalArgumentException("请先在设置中填写模型名称");
         JSONObject payload=new JSONObject().put("model",model).put("messages",messages).put("stream",false).put("max_tokens",maxTokens);
+        if(nonThinking)requestNonThinking(payload,provider,model);
         if(temperature!=null)payload.put("temperature",Math.max(0,Math.min(2,temperature)));
         String key=cfg.getString("api_key");
         HttpResult result;
@@ -360,12 +446,22 @@ final class Api {
             if(choices==null||choices.length()==0)throw new IllegalStateException("模型没有返回回答");
             JSONObject first=choices.getJSONObject(0);String reason=first.optString("finish_reason","");
             boolean truncated="length".equals(reason)||"max_tokens".equals(reason)||"output_limit".equals(reason);
-            String content=first.optJSONObject("message")!=null?first.getJSONObject("message").optString("content","").trim():"";
-            if(content.isEmpty())throw new IllegalStateException("模型正式回答为空，请调整模型输出额度");
+            JSONObject message=first.optJSONObject("message");
+            String content=message!=null?message.optString("content","").trim():"";
             JSONObject usage=parsed.optJSONObject("usage");
-            return new ChatResult(content,truncated,usage==null?0:usage.optInt("prompt_tokens",usage.optInt("input_tokens",0)),usage==null?0:usage.optInt("completion_tokens",usage.optInt("output_tokens",0)));
+            int inputTokens=usage==null?0:usage.optInt("prompt_tokens",usage.optInt("input_tokens",0));
+            int outputTokens=usage==null?0:usage.optInt("completion_tokens",usage.optInt("output_tokens",0));
+            if(content.isEmpty())throw new EmptyContentException("模型正式回答为空（"+provider+" / "+model+"，finish_reason="+reason+"）；可能只返回思考过程",inputTokens,outputTokens,message==null?0:message.optString("reasoning_content","").length());
+            return new ChatResult(content,truncated,inputTokens,outputTokens);
         }catch(IllegalStateException ex){throw ex;}
         catch(Exception ex){throw new IllegalStateException("API 响应格式无法解析："+shorten(redact(result.body,key),400));}
+    }
+
+    static final class EmptyContentException extends IllegalStateException {
+        final int inputTokens,outputTokens,reasoningChars;
+        EmptyContentException(String message,int inputTokens,int outputTokens,int reasoningChars){
+            super(message);this.inputTokens=inputTokens;this.outputTokens=outputTokens;this.reasoningChars=reasoningChars;
+        }
     }
 
     static final class IOExceptionWithStatus extends Exception {

@@ -6,6 +6,8 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -16,6 +18,26 @@ import org.xml.sax.InputSource;
 import java.io.StringReader;
 
 final class EpubImport {
+    static final class ImageAsset {
+        final String name,mime;final byte[] content;
+        ImageAsset(String name,String mime,byte[] content){this.name=name;this.mime=mime;this.content=content;}
+    }
+    static List<ImageAsset> extractImages(InputStream input) throws Exception {
+        List<ImageAsset> images=new ArrayList<>();long total=0;
+        try(ZipInputStream zip=new ZipInputStream(input)){
+            ZipEntry entry;
+            while((entry=zip.getNextEntry())!=null){
+                String name=entry.getName();if(entry.isDirectory()||name.startsWith("/")||name.contains(".."))continue;
+                String lower=name.toLowerCase(java.util.Locale.ROOT),mime=lower.endsWith(".jpg")||lower.endsWith(".jpeg")?"image/jpeg":lower.endsWith(".png")?"image/png":lower.endsWith(".gif")?"image/gif":lower.endsWith(".webp")?"image/webp":"";
+                if(mime.isEmpty()||entry.getSize()>12_000_000)continue;
+                ByteArrayOutputStream bytes=new ByteArrayOutputStream();byte[] block=new byte[32768];int count;
+                while((count=zip.read(block))!=-1){if(bytes.size()+count>12_000_000)throw new IllegalArgumentException("EPUB 单张图片超过 12 MB");bytes.write(block,0,count);}
+                total+=bytes.size();if(total>80_000_000)throw new IllegalArgumentException("EPUB 图片总量超过 80 MB");
+                images.add(new ImageAsset(name.substring(name.lastIndexOf('/')+1),mime,bytes.toByteArray()));
+            }
+        }
+        return images;
+    }
     private static Document xml(String data) throws Exception {
         DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();
         factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl",true);

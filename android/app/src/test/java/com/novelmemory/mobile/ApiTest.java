@@ -19,6 +19,22 @@ import org.robolectric.annotation.Config;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk=28)
 public class ApiTest {
+    @Test public void nonThinkingParametersRespectProviderAndMandatoryModels() throws Exception {
+        JSONObject deepseek=new JSONObject(),siliconflow=new JSONObject(),openrouter=new JSONObject(),glm=new JSONObject(),gemini=new JSONObject(),mandatory=new JSONObject(),local=new JSONObject();
+        Api.requestNonThinking(deepseek,"deepseek","deepseek-flash");
+        Api.requestNonThinking(siliconflow,"siliconflow","Pro/zai-org/GLM-4.7");
+        Api.requestNonThinking(openrouter,"openrouter","deepseek/deepseek-v4-flash");
+        Api.requestNonThinking(glm,"glm","glm-4.7");
+        Api.requestNonThinking(gemini,"gemini","gemini-2.5-flash");
+        Api.requestNonThinking(mandatory,"gemini","gemini-2.5-pro");
+        Api.requestNonThinking(local,"lmstudio","qwen3-local");
+        assertEquals("disabled",deepseek.getJSONObject("thinking").getString("type"));
+        assertFalse(siliconflow.getBoolean("enable_thinking"));
+        assertFalse(openrouter.getJSONObject("reasoning").getBoolean("enabled"));
+        assertEquals("disabled",glm.getJSONObject("thinking").getString("type"));
+        assertEquals("none",gemini.getString("reasoning_effort"));
+        assertEquals(0,mandatory.length());assertEquals(0,local.length());
+    }
     @Test public void geminiAndGlmHaveIndependentProfiles() throws Exception {
         Context context=RuntimeEnvironment.getApplication();
         context.getSharedPreferences("api_profiles",Context.MODE_PRIVATE).edit().clear().commit();
@@ -33,16 +49,17 @@ public class ApiTest {
     @Test public void independentProvidersAndChatEndpoint() throws Exception {
         Context context=RuntimeEnvironment.getApplication();
         context.getSharedPreferences("api_profiles",Context.MODE_PRIVATE).edit().clear().commit();
-        AtomicReference<String> body=new AtomicReference<>();
+        AtomicReference<String> body=new AtomicReference<>(),generationBody=new AtomicReference<>();
         ServerSocket server=new ServerSocket(0,1,java.net.InetAddress.getByName("127.0.0.1"));
         Thread responder=new Thread(()->{
-            try(Socket socket=server.accept()){
+            for(int requestIndex=0;requestIndex<2;requestIndex++)try(Socket socket=server.accept()){
                 java.io.InputStream input=socket.getInputStream();ByteArrayOutputStream headers=new ByteArrayOutputStream();
                 int b;while((b=input.read())!=-1){headers.write(b);byte[] a=headers.toByteArray();int n=a.length;if(n>=4&&a[n-4]==13&&a[n-3]==10&&a[n-2]==13&&a[n-1]==10)break;}
                 String head=headers.toString("UTF-8");int length=0;
                 for(String line:head.split("\\r\\n"))if(line.toLowerCase().startsWith("content-length:"))length=Integer.parseInt(line.substring(15).trim());
                 byte[] request=new byte[length];int pos=0;while(pos<length){int read=input.read(request,pos,length-pos);if(read<0)break;pos+=read;}
-                body.set(new String(request,StandardCharsets.UTF_8));
+                if(requestIndex==0)body.set(new String(request,StandardCharsets.UTF_8));
+                else generationBody.set(new String(request,StandardCharsets.UTF_8));
                 byte[] response="{\"choices\":[{\"message\":{\"content\":\"测试成功\"},\"finish_reason\":\"stop\"}]}".getBytes(StandardCharsets.UTF_8);
                 java.io.OutputStream output=socket.getOutputStream();
                 output.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+response.length+"\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
@@ -65,6 +82,9 @@ public class ApiTest {
             assertEquals("model-a",sent.getString("model"));
             assertEquals("你好",sent.getJSONArray("messages").getJSONObject(0).getString("content"));
             assertEquals(128,sent.getInt("max_tokens"));
+            assertEquals("disabled",sent.getJSONObject("thinking").getString("type"));
+            assertEquals("测试成功",api.chatDetailed(messages,128,10,null,false).content);
+            assertFalse(new JSONObject(generationBody.get()).has("thinking"));
         } finally {server.close();responder.join(1000);}
     }
 
